@@ -1,0 +1,22 @@
+# Runtime state / logs (never commit usage data)
+rate_limit_state.json
+*.tee.log
+*.log
+
+# Personal / local Claude Code config (keep private instructions out of the repo;
+# the public-facing template lives at examples/CLAUDE.md.snippet)
+CLAUDE.md
+.claude/settings.local.json
+
+# Secrets / environment (defensive: never publish credentials)
+.env
+.env.*
+*.pem
+*.key
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
