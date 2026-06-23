@@ -32,7 +32,8 @@ resets.
 
 ## How it works
 
-```mermaid
+<!-- Rendered as SVG so it shows everywhere (incl. the GitHub mobile app, which
+     does not render Mermaid). Diagram source kept here for easy editing:
 flowchart TD
   CC["Claude Code / statusline stdin<br/>(JSON incl. rate_limits)"] --> TEE["statusline-tee.sh<br/>(atomic write)"]
   TEE --> ST[(rate_limit_state.json)]
@@ -41,7 +42,8 @@ flowchart TD
   V -->|OK / exit 0| GO[launch]
   V -->|DEFER / exit 10| W[defer to RESETS_AT]
   V -->|UNKNOWN / exit 20| FO[fail-open: proceed + flag]
-```
+-->
+![claude-rate-guard data flow: Claude Code statusline stdin → statusline-tee.sh → rate_limit_state.json → rate-guard.sh → VERDICT (OK launches, DEFER defers to RESETS_AT, UNKNOWN fails open)](docs/assets/architecture.svg)
 
 1. **`statusline-tee.sh`** is appended to your existing `statusLine.command`. On
    each status-line render, it reads the usage percentages and reset times from
