@@ -3,25 +3,25 @@
 | Item | Content |
 | -------- | ---------------------------------------------------------------------- |
 | Document ID | SPEC-RATEGUARD-001 |
-| Intended readers | Architects / implementing agents / adopters in each repository |
-| Scope | **Repository-agnostic** (designed to be ported widely). Portable to any repository that runs under Claude Code. Written on the assumption that it can also be **newly introduced into an environment that has no status line configured yet**. |
-| Prerequisites | Claude Code (a build that has the status-line mechanism **and** the Workflow tool). `bash` / `jq` / `awk` / `date` available. **Fetching `rate_limits` requires a Claude.ai Pro/Max subscription** (§2.4). **A means of supplying the current time to the agent every turn** (e.g. injecting the time via a `UserPromptSubmit` hook), because the scheduling/announcements of FR-07/08 depend on time (§2.4 · §8). |
+| Intended readers | Designers / implementing agents / adopters in each repository |
+| Scope | **Not tied to a specific repository** (meant to be rolled out to other repositories too). It can be moved to any repository that runs under Claude Code. Written on the assumption that it can also be **newly installed in an environment that has no status line set up yet**. |
+| Prerequisites | Claude Code (a version that has the status-line mechanism and the Workflow tool). `bash` / `jq` / `awk` / `date` must be available. **Reading `rate_limits` requires a Claude.ai Pro/Max plan** (§2.4). **A way to give the agent the current time each turn** (for example, passing the time through a `UserPromptSubmit` hook), because the scheduling and notifications in FR-07/08 depend on time (§2.4, §8). |
 
 > 日本語の原典は [`SPEC.ja.md`](./SPEC.ja.md)。
 
 ---
 
-## 1. Purpose of this document
+## 1. What this document is
 
-This document is the requirements specification for **rate-guard**, an auxiliary component that **judges, before launch, how much of Claude Code's 5-hour session-usage window (and 7-day window) remains, and automatically defers the launch of a long-running workflow to the next window when the remaining headroom is below a threshold**. The goal is to let an adopter in a different environment — **including repositories/users that have not yet configured a status line** — build an equivalent from scratch based on this document.
+"**rate-guard**" is a helper tool that **checks how much of Claude Code's 5-hour usage window (and 7-day window) is left before launch, and automatically defers the launch of a long-running workflow to the next window when little is left**. This document is its requirements specification. The goal is that an adopter in another environment, including one that has not set up a status line yet, can read it and build the same thing from scratch.
 
-This component is **advisory (non-enforcing)**. Rather than the harness mechanically blocking tool calls, it **keeps the decision material on disk at all times, and the agent consults it just before launch and defers on its own judgment**. Enforcement (blocking via hooks) is out of scope (§10 · see Appendix C).
+The tool **only detects; it does not enforce**. Instead of the harness mechanically blocking tool calls, it **keeps the decision material on disk at all times, and the agent reads it just before launch and defers on its own judgment**. Enforcement (blocking through a hook) is out of scope for this document (see §10 and Appendix C).
 
-### 1.1 Problem solved
+### 1.1 The problem it solves
 
-- An agent inside Claude Code **has no API/tool that returns its own 5-hour window consumption rate or the next window's reset time**. The `Workflow` `budget` is "the output-token target for that turn", which is a different thing from the account's session window.
-- On the other hand, **the status-line command's stdin is given `rate_limits` (authoritative, server-provided values)**. Capturing that lets code make the decision.
-- Launching a long-running workflow with little headroom left means **the window runs out mid-flight and the workflow is interrupted / totally lost**. Rejecting it before launch avoids the fragile stop/resume operation itself.
+- An agent in Claude Code **has no API or tool that returns its own 5-hour usage rate or the next window's reset time**. The `Workflow` `budget` is "the output-token target for that turn", which is separate from the account's usage window.
+- On the other hand, **the status-line command's standard input is given `rate_limits` (the authoritative values the server returns)**. If you save those, you can decide in code.
+- If you launch a long-running workflow with little left, **the window runs out partway through, the workflow is interrupted, and the whole run is wasted**. Stopping it before launch avoids the fragile stop-and-resume operation itself.
 
 ---
 
@@ -29,45 +29,45 @@ This component is **advisory (non-enforcing)**. Rather than the harness mechanic
 
 ### 2.1 Background
 
-In an operation that runs long (tens of minutes) processing inside a single-turn workflow, exhaustion of the 5-hour window produces the worst failure: "hit mid-flight → interrupted". The post-hit message does not reach the agent's context in a form it can actively retrieve, so after-the-fact handling is unreliable. **Deciding launchability before launch (a pre-flight gate)** is the most robust approach.
+When you run a long (tens of minutes) process as a single-turn workflow, running out of the 5-hour window leads to the worst failure: "window runs out partway, then interrupted". The message after the window runs out does not reach the agent's context in a usable form, so handling it after the fact is unreliable. **Deciding whether to launch before launch (a pre-flight gate)** is the most robust approach.
 
 ### 2.2 Goals
 
-- **Continuously keep on disk (tee)** the authoritative values that the status-line command receives. For environments with no status line configured, **newly configure** a status-line command that has this capture built in (Appendix A-1).
-- Provide **a pure-code decision tool** that reads that capture and **compares the 5-hour window usage rate against a threshold (default 80%) to return launchability**.
-- Define the behavioral contract by which the agent **calls the decision tool right before launching a long-running workflow, and defers to the next window on DEFER** (pre-flight · FR-06).
-- For **a single workflow that exceeds one window (5h)**, define the behavioral contract of a mid-run watchdog that polls the decision tool while running and, on threshold breach, **stops at a phase boundary → resumes automatically after reset via `resumeFromRunId`** (FR-08).
+- **Always save to disk (tee)** the authoritative values the status-line command receives. For an environment with no status line, **newly set up** a status-line command with this saving built in (Appendix A-1).
+- Provide a **code-only decision tool** that reads that copy and **compares the 5-hour usage rate against a threshold (default 80%) to return whether launch is allowed**.
+- Define the behavior rule by which the agent **calls the decision tool right before launching a long-running workflow and, on DEFER, defers to the next window** (pre-flight, FR-06).
+- For a **single workflow that exceeds one window (5 hours)**, define the mid-run watchdog rule: monitor with the decision tool while it runs and, when the threshold is reached, **stop at a boundary and resume automatically after the reset with `resumeFromRunId`** (FR-08).
 
 ### 2.3 Scope boundary (**must read**)
 
-| Function | In / Out of scope | Rationale |
+| Function | In / Out of scope | Reason |
 | --------------------------------------------- | --------------- | --------------------------------------------------- |
-| Newly configuring the status-line command / appending the tee | In | The only route to the authoritative values. Passive · free. In unconfigured environments, new creation is the starting point of adoption |
-| rate_limit capture output (tee) from the status line | In | The only route to the authoritative values. Passive · free |
-| 5-hour window threshold judgment (gate · pure code) | In | Arithmetic is code (no LLM) |
-| The pre-flight deferral behavioral contract (agent side) | In | The primary purpose of this component |
-| Scheduling the launch into the next window on DEFER | In | The reset time is in the capture, so reservation is deterministic |
-| **mid-run watchdog** (monitor while running → on threshold breach, stop → resume automatically after reset) | **In** | Essential for completing a single task that exceeds one window. Pre-flight cannot save it (FR-08 · Appendix B) |
-| **Enforcement (blocking via a PreToolUse hook)** | **Out** | A foot-gun that acts indiscriminately on all workflows. Decide separately (Appendix C) |
-| Gating dispatcher-managed tasks (via Slack, etc.) | **Out** | For those, checkpoint → process exit → re-dispatch is the proper path |
-| A 24/7 resident daemon | **Out** | The executor of the judgment is the agent. It only works while the session is running |
+| Newly setting up the status-line command / appending the tee | In | The only route to the authoritative values. Passive and free. In an unset environment, creating it is where adoption starts |
+| Saving the rate_limit copy (tee) from the status line | In | The only route to the authoritative values. Passive and free |
+| The 5-hour threshold decision (gate, code only) | In | The calculation is done in code (no LLM) |
+| The pre-flight deferral behavior rule (agent side) | In | The main purpose of this tool |
+| Scheduling the launch into the next window on DEFER | In | The reset time is in the copy, so it can be scheduled with a fixed procedure |
+| **mid-run watchdog** (monitor while running, stop on threshold, resume automatically after reset) | **In** | Needed to finish a single task that exceeds one window. Pre-flight cannot save it (FR-08, Appendix B) |
+| **Enforcement (blocking with a PreToolUse hook)** | **Out** | A risk that acts on every workflow uniformly. Decide separately (Appendix C) |
+| Gating dispatcher-managed tasks (through Slack, etc.) | **Out** | For those, "stop at a boundary, exit the process, re-dispatch" is the right path |
+| A program that stays resident 24 hours | **Out** | The agent runs the decision. It works only while the session is running |
 
-### 2.4 Applicability prerequisites and coverage (**must read · verify before adoption**)
+### 2.4 Prerequisites and coverage (**must read, check before adoption**)
 
-For this gate to work on authoritative values (return `OK`/`DEFER`), the **target state** in the table below must hold. Under conditions that are not met, it **degrades to permanent/temporary `UNKNOWN`, fail-open**, and the gate is silently disabled (it does not block, but it does not protect). At adoption time, always make these degradation conditions known.
+For this gate to work on authoritative values (return `OK`/`DEFER`), the **target state** in the table below must hold. When it does not, the gate **falls back to the safe side, switching to a permanent or temporary `UNKNOWN`**, and is silently disabled (it does not block, but it does not protect either). At adoption time, always make these fallback conditions known.
 
 | Environment condition | Gate behavior | Action at adoption |
 | --- | --- | --- |
-| Interactive TUI & Pro/Max & status line configured & after first API response | **Normal** (OK/DEFER) | The target state this document aims for |
-| **`statusLine.command` unset** | Permanent `UNKNOWN` (the state file is never generated) | Resolved by **newly configuring** it per §11 · Appendix A-1. The primary adoption route of this document |
-| **headless / non-interactive launch** (`claude -p` · SDK · non-interactive cron) | State is not updated and goes stale → `UNKNOWN` | The status line fires only on interactive UI events. **Launch long-running WFs from an interactive session.** Routine headless use is outside this gate's coverage |
-| **API-key billing (non Pro/Max)** | `rate_limits` itself never arrives on stdin → permanent `UNKNOWN` | This gate is inapplicable. It passes through fail-open; the hit itself is backstopped by the harness's rate-limit error |
-| Before the first API response | Temporary `UNKNOWN` | Resolved after one round trip (not permanent) |
-| **The agent is not supplied the current time** (no time-injection hook, etc.) | The gate's OK/DEFER itself is normal (the gate uses the shell's `date`). However, **the reservation-timing decisions and user announcements of FR-07/08 become unreliable** | Inject the current time every turn via `UserPromptSubmit` etc. (§8) |
+| Interactive TUI and Pro/Max and status line set up and after the first API response | **Normal** (OK/DEFER) | The state this document aims for |
+| **`statusLine.command` not set** | Permanent `UNKNOWN` (the state file is never created) | Fixed by **newly setting it up** per §11 and Appendix A-1. The main adoption route in this document |
+| **headless / non-interactive launch** (`claude -p`, SDK, non-interactive cron) | The state is not updated and goes stale, so `UNKNOWN` | The status line runs only on interactive UI actions. **Launch long-running workflows from an interactive session.** Routine headless use is out of scope |
+| **API-key billing (non Pro/Max)** | `rate_limits` itself never reaches standard input, so permanent `UNKNOWN` | This gate cannot be used. It passes through on the safe side, and the harness's rate-limit error is the last stop for the window running out |
+| Before the first API response | Temporary `UNKNOWN` | Fixed after one round trip (not permanent) |
+| **The agent is not given the current time** (no time-passing hook, etc.) | The gate's OK/DEFER itself is normal (the gate uses the shell's `date`). But **the scheduling decisions and user notifications in FR-07/08 become unreliable** | Pass the current time each turn with `UserPromptSubmit`, etc. (§8) |
 
-- All degradations are **fail-open** (never block), so "it won't break", but the state of "thinking you're protected while you aren't" is dangerous. Per NFR-07, always surface `UNKNOWN` via `REASON`.
-- **Time sense is a prerequisite of agent behavior (FR-06/07/08), not of the gate judgment (gate)**: the judgment itself holds via the shell's `date`, but the timing of deferral reservations and the announcements require time awareness.
-- `rate_limits` appears on stdin **only after the first API response of a Claude.ai Pro/Max subscriber**, and `five_hour` / `seven_day` can independently be absent (§8 · per the official schema).
+- Every fallback is on the **safe side (does not block)**, so "it will not break", but "thinking you are protected when you are not" is dangerous. As in NFR-07, always make `UNKNOWN` visible through `REASON`.
+- **Knowing the time is a prerequisite of the agent's behavior (FR-06/07/08), not of the gate decision.** The decision itself holds with the shell's `date`, but the timing of the deferral and the notification need awareness of the time.
+- `rate_limits` appears on standard input **only after the first API response of a Claude.ai Pro/Max subscriber**, and `five_hour` / `seven_day` can each be missing (§8, per the official schema).
 
 ---
 
@@ -76,13 +76,13 @@ For this gate to work on authoritative values (return `OK`/`DEFER`), the **targe
 | Term | Definition |
 | --- | --- |
 | **scope-(i)** | A `Workflow` tool launch that the agent runs directly within a conversation. The target of this gate |
-| **status-line command** | The shell registered in `statusLine.command` of `settings.json`. Claude Code passes JSON on stdin and executes it on UI events. Refers to **the command itself, not the visible on-screen bar** |
+| **status-line command** | The shell registered in `statusLine.command` of `settings.json`. Claude Code passes JSON on standard input and runs it on UI actions. It means **the command itself, not the bar visible on screen** |
 | **tee** | The processing that copies the rate_limit state to a file each time the status-line command runs |
-| **gate** | The decision script that reads the capture and returns launchability (OK/DEFER/UNKNOWN) |
-| **5-hour window / 7-day window** | The rolling windows of Claude's session usage caps |
-| **`used_percentage`** | The consumption rate of that window (0–100, server-provided) |
-| **`resets_at`** | The time that window resets (UNIX epoch seconds, server-provided) |
-| **fail-open** | A safe-side design: when the decision material is missing/stale, do not block — allow launch (and surface the uncertainty) |
+| **gate** | The decision script that reads the copy and returns whether launch is allowed (OK/DEFER/UNKNOWN) |
+| **5-hour window / 7-day window** | The windows that count Claude's usage limit while moving over a fixed time span |
+| **`used_percentage`** | The usage rate of that window (0–100, a value the server returns) |
+| **`resets_at`** | The time that window resets (UNIX epoch seconds, a value the server returns) |
+| **fail-open** | A safe-side design: when the decision material is missing or stale, do not block; allow launch (but state that it is unknown) |
 
 ---
 
@@ -90,39 +90,39 @@ For this gate to work on authoritative values (return `OK`/`DEFER`), the **targe
 
 ```
 [Claude Code core]
-   │  passes stdin JSON every time the status-line command runs (on UI events · interactive TUI only)
-   │  (.rate_limits.five_hour.{used_percentage,resets_at} etc. = authoritative values)
+   │  passes standard-input JSON each time the status-line command runs (on UI actions, interactive TUI only)
+   │  (.rate_limits.five_hour.{used_percentage,resets_at}, etc. = authoritative values)
    ▼
 [statusline-command.sh]  ──(tee: atomic write)──▶  [rate_limit_state.json]
    │                                                      │
-   │ (optionally render to terminal; tee has zero side effects and keeps rendering even on failure)  │ read-only
+   │ (optionally render to screen; tee has no side effect on it and keeps drawing even on failure)  │ read-only
    ▼                                                      ▼
-[terminal UI (optional · may be empty)]            [rate-guard.sh]  ──▶  VERDICT=OK|DEFER|UNKNOWN
+[terminal UI (optional, may be empty)]             [rate-guard.sh]  ──▶  VERDICT=OK|DEFER|UNKNOWN
                                                                         (exit 0 / 10 / 20)
                                                             │
                                                             ▼
                                       [agent]  runs the gate right before launch and
-                                        OK→launch / DEFER→reserve for next window / UNKNOWN→launch+warn
+                                        OK→launch / DEFER→schedule for next window / UNKNOWN→launch + warn
 ```
 
-The data is **one-directional**: core → tee → state file → gate → agent behavior. The state file is read-only from the gate. **The presence of a visible bar is irrelevant to this flow**: even with empty stdout the status-line command runs, and the tee side effect runs (§8).
+The data flows in **one direction**: core → tee → state file → gate → agent behavior. The state file is read-only from the gate. **Whether a visible bar exists does not matter to this flow.** Even with empty standard output, the status-line command runs and the tee side effect runs (§8).
 
 ---
 
 ## 5. Functional requirements
 
-### FR-01 Status-line command (with capture tee built in)
+### FR-01 Status-line command (with the tee built in)
 
-- If the target environment has **no** status-line command, **newly configure the command this component provides (Appendix A-1)**. If one exists, **append** the tee block (**non-destructive**: do not change the existing rendering output or exit behavior at all).
-- From the stdin JSON the status-line command receives, extract `rate_limits.five_hour.{used_percentage,resets_at}` · `rate_limits.seven_day.{...}` · `context_window.used_percentage`, **attach the current time `written_at` (epoch seconds)**, and write to the state file.
-- **Atomic write required**: write to a temp file and replace with `mv -f`. Prevents partial reads by the reader.
-- **A write failure must not obstruct rendering**: isolate the tee from rendering, and have the script `exit 0` at the end. However, **do not swallow failures — leave a trace**: only on failure, record one line to `~/.claude/rate-guard.tee.log` (so that the protection silently disappearing on a quiet failure is detectable · NFR-09).
-- If the relevant fields are absent from stdin (non Pro/Max · before first response · version differences, etc.), set those values to **`null`** and keep the JSON itself always valid.
-- **The visible bar is optional**: emptying stdout shows nothing on screen, but the tee side effect still runs. To show a bar, use / replace the display block of Appendix A-1.
+- If the target environment has **no** status-line command, **newly set up the command this tool provides (Appendix A-1)**. If one exists, **append** the tee block (**non-destructive**: do not change the existing rendering output or exit behavior at all).
+- From the standard-input JSON the status-line command receives, take `rate_limits.five_hour.{used_percentage,resets_at}`, `rate_limits.seven_day.{...}`, and `context_window.used_percentage`, **add the current time `written_at` (epoch seconds)**, and write to the state file.
+- **An atomic write is required**: write to a temp file and replace it with `mv -f`. This stops the reader from reading a half-written state.
+- **A write failure must not block rendering**: keep the tee separate from rendering, and have the script `exit 0` at the end. But **do not swallow failures; leave a trace**. Only on failure, record one line to `~/.claude/rate-guard.tee.log` (so a silent failure that removes the protection can be detected, NFR-09).
+- If the relevant fields are missing from standard input (non Pro/Max, before the first response, version differences, etc.), set those values to **`null`** and keep the JSON itself always valid.
+- **The visible bar is optional**: if you empty standard output, nothing shows on screen, but the tee side effect still runs. To show a bar, use or replace the display block in Appendix A-1.
 
-### FR-02 State-file schema (interface contract · identical to §7)
+### FR-02 State-file format (the interface agreement, same as §7)
 
-Default path `~/.claude/rate_limit_state.json`.
+Default path: `~/.claude/rate_limit_state.json`.
 
 ```json
 {
@@ -133,74 +133,74 @@ Default path `~/.claude/rate_limit_state.json`.
 }
 ```
 
-- Numbers are the server-provided values as-is (decimals allowed). Unobtainable fields are `null`.
+- Numbers are the values the server returns, as is (decimals allowed). Fields that cannot be obtained are `null`.
 - `written_at` is the basis for the freshness check (FR-04).
 
 ### FR-03 gate (decision script)
 
 - Read the state file and compare `five_hour.used_percentage` against the **threshold (default 80)**.
-- **Judgment and exit codes**:
+- **Decision and exit codes**:
   - `used_percentage < threshold` → `VERDICT=OK`, exit **0**
-  - `used_percentage >= threshold` → `VERDICT=DEFER`, exit **10** (the boundary value is on the DEFER side)
+  - `used_percentage >= threshold` → `VERDICT=DEFER`, exit **10** (an equal value is on the DEFER side)
   - material missing or stale → `VERDICT=UNKNOWN`, exit **20**
-- **Output is machine-readable `KEY=VALUE` lines** (stdout): `VERDICT` / `FIVE_HOUR_PCT` / `RESETS_AT` / `RESETS_AT_HUMAN` / `REASON`.
-- Do floating-point comparison with `awk` etc. (do not round to bash integer comparison).
-- **Use no LLM at all** (coverage and arithmetic are code).
-- **Threshold sanity**: if `RATE_GUARD_THRESHOLD` falls outside the valid range `[10,95]`, **warn to stderr** (misconfiguration detection). Continue the judgment and **do not pollute the stdout KEY=VALUE contract**. This catches both setting it too high (defenseless) and too low (permanent-DEFER deadlock) early.
+- **The output is machine-readable `KEY=VALUE` lines** (standard output): `VERDICT` / `FIVE_HOUR_PCT` / `RESETS_AT` / `RESETS_AT_HUMAN` / `REASON`.
+- Compare decimals with `awk`, etc. (do not round to a bash integer comparison).
+- **Use no LLM at all** (decision and calculation are done in code).
+- **Threshold validity check**: if `RATE_GUARD_THRESHOLD` is outside the valid range `[10,95]`, **warn to standard error** (to catch a misconfiguration). Continue the decision and **do not pollute the standard-output KEY=VALUE**. This makes both "set too high (defenseless)" and "set too low (stuck in permanent DEFER)" noticeable early.
 
-### FR-04 Freshness / absence = fail-open (surface and distinguish the cause)
+### FR-04 Freshness and absence = safe side (show the cause, distinguished)
 
-- Return `UNKNOWN` (exit 20) when the state file **does not exist / `written_at` is missing or non-numeric / `five_hour.used_percentage` is `null` / `written_at` is older than `STALE_SECONDS` (default 900 s) from now** — any one of these.
-- UNKNOWN **does not block** (fail-open). The reason: avoid wrongly stopping all workflows for first-run not-yet-generated, post-idle staleness, non Pro/Max, or non-firing under headless. The hit itself is backstopped by the harness's rate-limit error.
-- **Do not stay silent — distinguish the cause via `REASON`** (the same UNKNOWN calls for different handling):
-  - no state file → "`statusLine.command` unset or tee not yet run"
-  - `written_at` missing/non-numeric → "suspected state corruption / tee failure (see `rate-guard.tee.log`)". Validate as integer before arithmetic and return UNKNOWN without crashing even on non-numeric
-  - `used_percentage` is `null` → "**rate_limits absent = non Pro/Max or before first response**. Gate inoperative here" (possibly structural · permanent)
-  - stale → "stale. **If mid-session, suspect tee failure** (see `rate-guard.tee.log`)" (temporary or failure)
+- Return `UNKNOWN` (exit 20) if any of these hold: the state file **does not exist / `written_at` is missing or not a number / `five_hour.used_percentage` is `null` / `written_at` is older than `STALE_SECONDS` (default 900 seconds) from now**.
+- UNKNOWN **does not block** (fail-open). The reason is to avoid wrongly stopping every workflow because of a first-run not-yet-created file, going stale after idle time, non Pro/Max, or not firing under headless. The window running out itself is backstopped by the harness's rate-limit error.
+- **Do not stay silent; distinguish the cause through `REASON`** (the same UNKNOWN calls for different handling):
+  - no state file → "`statusLine.command` not set or tee not run yet"
+  - `written_at` missing or not a number → "suspected state corruption / tee failure (see `rate-guard.tee.log`)". Check that it is an integer before calculating, and return UNKNOWN without crashing even when it is not a number
+  - `used_percentage` is `null` → "**rate_limits absent = non Pro/Max or before the first response**. The gate does not work here" (possibly structural and permanent)
+  - stale → "stale. **If mid-session, suspect a tee failure** (see `rate-guard.tee.log`)" (temporary or a failure)
 
-### FR-05 Configuration parameters (overridable via environment variables)
+### FR-05 Configuration parameters (overridable with environment variables)
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `RATE_GUARD_THRESHOLD` | `80` | The lower bound of usage rate at which launch is stopped (DEFER at this value or above) |
-| `RATE_GUARD_STALE_SECONDS` | `900` | A capture older than this is UNKNOWN |
-| `RATE_GUARD_STATE_FILE` | `~/.claude/rate_limit_state.json` | Path of the capture (for test substitution) |
+| `RATE_GUARD_THRESHOLD` | `80` | The lower bound of the usage rate that stops launch (DEFER at this value or above) |
+| `RATE_GUARD_STALE_SECONDS` | `900` | A copy older than this is UNKNOWN |
+| `RATE_GUARD_STATE_FILE` | `~/.claude/rate_limit_state.json` | The path of the copy (for swapping in tests) |
 
-- The **valid range of `RATE_GUARD_THRESHOLD` is `[10,95]`** (outside it triggers the FR-03 warning). Even when you want a permanent change, **pass it via env at gate-call time, not in `settings.json`** — fixing a threshold below the steady-state usage rate makes it exceed the threshold again after reset, causing a **permanent-DEFER deadlock** (§12).
+- The **valid range of `RATE_GUARD_THRESHOLD` is `[10,95]`** (outside it triggers the FR-03 warning). Even for a permanent change, **pass it through an environment variable at the gate call, not in `settings.json`**. Fixing a threshold below your usual usage rate means it exceeds the threshold again after the reset, leaving you **stuck in permanent DEFER** (§12).
 
-### FR-06 Agent behavioral contract (the core of being non-enforcing)
+### FR-06 Agent behavior rule (the core of the detect-only design)
 
-In scope-(i), **right before launching a long-running workflow that runs to completion in a single shot**, run the gate and follow the `VERDICT`:
+In scope-(i), run the gate **right before launching a long-running workflow that runs to completion in one shot** and follow the `VERDICT`:
 
 | VERDICT | Behavior |
 | --- | --- |
-| `OK` | Launch as-is |
-| `DEFER` | **Do not launch.** Reserve the launch right after `RESETS_AT`, and tell the user "deferred to the next window (`RESETS_AT_HUMAN`)" |
-| `UNKNOWN` | Launch fail-open, but explicitly state "remaining budget unknown" (kindly also note which of the §2.4 degradation conditions may apply) |
+| `OK` | Launch as is |
+| `DEFER` | **Do not launch.** Schedule the launch right after `RESETS_AT`, and tell the user "deferred to the next window (`RESETS_AT_HUMAN`)" |
+| `UNKNOWN` | Launch on the safe side, but state clearly that "the remaining amount is unknown" (it is helpful to also note which of the §2.4 fallback conditions may apply) |
 
-- State this contract clearly in **the agent memory or operating documentation (CLAUDE.md etc.) of the porting-target repository**, so it is referenced even across context summarization (because, being non-enforcing, it depends on recall).
+- Write this rule clearly in the **agent memory or operating documentation (such as CLAUDE.md) of the adopting repository**, so it is referenced even across a context summary (because, being detect-only, it depends on whether it is recalled).
 
 ### FR-07 Scheduling on DEFER
 
-- The reservation time is `RESETS_AT` (+ a small margin).
-- If reset is **within 1 hour**, use a short-sleep mechanism (e.g. `ScheduleWakeup`, max 3600 s). If **further out**, use a one-shot cron (e.g. `CronCreate`) or a chain of sleeps.
-- **Re-check at resume**: after the reservation fires, run the gate once more right before launching, and launch only after confirming `OK` (to prevent thrash — immediate re-hit from reset-estimate drift).
-- **Time sense is a prerequisite**: the "within 1 hour or beyond" branch and the `RESETS_AT_HUMAN` user announcement depend on **the agent knowing the current time**. A means of supplying the current time every turn (e.g. time injection via a `UserPromptSubmit` hook) is an operating condition (§2.4 · §8).
+- The scheduled launch time is `RESETS_AT` (plus a small margin).
+- If the reset is **within 1 hour**, use a short sleep mechanism (for example `ScheduleWakeup`, up to 3600 seconds). If it is **further out**, use a one-shot cron (for example `CronCreate`) or a chain of sleeps.
+- **Re-check at resume**: after the schedule fires, run the gate once more right before launch and confirm `OK` before launching (this prevents an immediate re-hit from drift in the reset estimate, which is thrash).
+- **Knowing the time is a prerequisite**: the branch of "within 1 hour or beyond" and the `RESETS_AT_HUMAN` user notification depend on **the agent knowing the current time**. A way to pass the current time each turn (for example, passing it through a `UserPromptSubmit` hook) is a condition for this to work (§2.4, §8).
 
-### FR-08 mid-run watchdog (completing a single workflow that exceeds one window)
+### FR-08 mid-run watchdog (finishing a single workflow that exceeds one window)
 
-Pre-flight (FR-06) only "doesn't start when headroom is scarce"; it **cannot save a single task that starts from full and eats one whole window (5h)**. This is the in-flight monitoring that complements it.
+Pre-flight (FR-06) only "does not start when little is left"; it **cannot save a single task that starts from full and eats one whole window (5 hours)**. This is the in-run monitoring that fills that gap.
 
-- **Applicability**: a single workflow (prefer read-only) that passed pre-flight as `OK` but whose consumption may exceed one window.
+- **When it applies**: a single workflow that passed pre-flight with `OK` but whose use may exceed one window (prefer read-only).
 - **Launch**: start the `Workflow` with `run_in_background` and keep the `runId`.
-- **Polling**: the agent wakes at a coarse interval and runs `rate-guard.sh`.
-  - `OK` and running → re-schedule the next poll.
-  - `DEFER` (≥ threshold) and running → **`TaskStop(runId)`** (the journal is preserved) → record `RESETS_AT` and reserve resume (same scheduling as FR-07).
-  - completion notification received → end the loop (collect the artifacts).
-- **Resume**: reservation fires → re-check with `rate-guard.sh` → `OK` → continue with `Workflow(scriptPath, resumeFromRunId=runId)` → re-enter the poll loop. **If it spans multiple windows, repeat on every DEFER**.
-- **Why actively stop at 80%**: if you wait for the 100% hit, the Workflow's `agent()` is swallowed into `null` after retries and a **degraded result is returned silently** (silent truncation). A `TaskStop` at the threshold interrupts cleanly and leaves the journal, avoiding this.
-- **Safety**: because the stop is an external poll, it **cannot guarantee a phase boundary**. An interrupted agent re-runs on resume, so **read-only WFs are harmless**; side-effecting WFs are premised on idempotency keys (loose-coupling contract #4).
-- Detailed procedure in Appendix B.
+- **Monitoring (polling)**: the agent wakes at a coarse interval and runs `rate-guard.sh`.
+  - `OK` and running → schedule the next check.
+  - `DEFER` (≥ threshold) and running → **`TaskStop(runId)`** (the journal is kept) → record `RESETS_AT` and schedule the resume (same procedure as FR-07).
+  - completion notice received → end the loop (collect the results).
+- **Resume**: the schedule fires → re-check with `rate-guard.sh` → `OK` → continue with `Workflow(scriptPath, resumeFromRunId=runId)` → return to the monitoring loop. **If it spans several windows, repeat on each DEFER.**
+- **Why stop on purpose at 80%**: if you wait for the 100% hit, the Workflow's `agent()` is swallowed into `null` after retries, and **a degraded result is returned silently** (a silent cutoff). A `TaskStop` at the threshold stops cleanly and keeps the journal, which avoids this.
+- **Safety**: because you stop from outside, **it does not stop at a boundary (the phase boundary)**. The interrupted agent re-runs on resume, so a **read-only workflow is harmless**. One with writes presupposes an idempotency key (loose-coupling agreement #4).
+- See Appendix B for the detailed procedure.
 
 ---
 
@@ -208,37 +208,37 @@ Pre-flight (FR-06) only "doesn't start when headroom is scarce"; it **cannot sav
 
 | ID | Requirement |
 | --- | --- |
-| NFR-01 | **Non-destructive**: do not change the existing status line's rendering / exit behavior. A tee failure does not propagate to rendering. New configuration also does not break Claude Code's default behavior |
-| NFR-02 | **Minimal added latency**: keep the tee to a single `jq` call |
-| NFR-03 | **Zero model-quota cost**: the judgment is pure shell. Consumes no LLM turn |
-| NFR-04 | **Durable**: the decision material is on disk and does not depend on the agent's loss of context (summarization · cache eviction) |
-| NFR-05 | **Portable**: the only dependencies are `bash`/`jq`/`awk`/`date`. Reset formatting works with either GNU or BSD `date` (both syntaxes fall through) |
-| NFR-06 | **Fail-open safe**: when unknown, do not block — surface the uncertainty |
-| NFR-07 | **No silent truncation**: always explain DEFER/UNKNOWN via `REASON`, and announce deferrals to the user |
-| NFR-08 | **Low-cost mid-run poll**: monitoring polls run at a coarse interval (mindful of cache retention), each doing only "read state + numeric compare". Near the cap, monitoring itself must not eat up the window |
-| NFR-09 | **Observability of tee failure**: the tee does not swallow failures — it leaves a trace (`rate-guard.tee.log`). It does not break rendering (`exit 0` at the end). Makes it detectable when the protection silently disappears on a quiet failure |
+| NFR-01 | **Non-destructive**: do not change the existing status line's rendering or exit behavior. A tee failure does not reach rendering. New setup also does not break Claude Code's default behavior |
+| NFR-02 | **Minimal added delay**: keep the tee to a single `jq` call |
+| NFR-03 | **Zero usage-window cost**: the decision is code only. It uses no LLM turn |
+| NFR-04 | **Hard to lose**: the decision material is on disk and does not depend on the agent losing context (summary, cache eviction) |
+| NFR-05 | **Easy to port**: the only dependencies are `bash`/`jq`/`awk`/`date`. Reset-time formatting works with GNU or BSD `date` (it tries both forms in order) |
+| NFR-06 | **Safe on the safe side**: when unknown, do not block; show that it is unknown |
+| NFR-07 | **No silent cutoff**: always explain DEFER/UNKNOWN through `REASON`, and notify the user of a deferral |
+| NFR-08 | **Keep monitoring cheap**: monitoring runs at a coarse interval (mindful of keeping the cache) and each time only "reads the state and compares numbers". Near the limit, monitoring itself must not eat up the window |
+| NFR-09 | **Make tee failures visible**: the tee does not swallow failures; it leaves a trace (`rate-guard.tee.log`). It does not break rendering (`exit 0` at the end). This makes it possible to detect when a silent failure removes the protection |
 
 ---
 
-## 7. Interface contract (promises that must not be broken)
+## 7. The interface agreement (promises you must not break)
 
-1. **The state-file schema** (FR-02). Do not change key names, the epoch-seconds `written_at`, or the `null` allowance.
-2. **The gate stdout contract**: `KEY=VALUE` lines · key names `VERDICT/FIVE_HOUR_PCT/RESETS_AT/RESETS_AT_HUMAN/REASON`.
-3. **Exit codes**: `0=OK / 10=DEFER / 20=UNKNOWN`. Callers may branch on these codes.
+1. **The state-file format** (FR-02). Do not change the key names, the epoch seconds of `written_at`, or the allowance of `null`.
+2. **The gate's standard-output agreement**: `KEY=VALUE` lines, key names `VERDICT/FIVE_HOUR_PCT/RESETS_AT/RESETS_AT_HUMAN/REASON`.
+3. **Exit codes**: `0=OK / 10=DEFER / 20=UNKNOWN`. The caller may branch on these codes.
 4. The data flow is one-directional (§4). The gate treats the state as **read-only** and does not rewrite it.
 
 ---
 
-## 8. Prerequisites and diffs at adoption (**must verify before adoption**)
+## 8. Prerequisites and differences at adoption (**always check before adoption**)
 
-- **The most important prerequisite (observability)**: first confirm whether the target Claude Code **actually passes** `rate_limits.five_hour.used_percentage` / `resets_at` on the status-line stdin (insert an echo debug into `statusLine.command` / inspect the generated state file). In environments where it is not passed (the §2.4 degradation conditions), this component degrades to permanent `UNKNOWN` (fail-open) and the gate does not function.
-- **The status-line firing conditions (official)**: `statusLine.command` runs **after a new assistant message · when `/compact` completes · on permission-mode change · on Vim-mode toggle**, and updates are debounced by 300ms. **If unset, it never runs.** These are interactive UI events; design on the premise that they do not fire under headless/print mode (§2.4).
-- **The `rate_limits` provisioning condition (official)**: `rate_limits` appears on stdin **after the first API response of a Claude.ai Pro/Max subscriber**. `five_hour` / `seven_day` can independently be absent. It does not arrive for API-key billing users.
-- **Independence of the visible bar (official)**: even if the script outputs nothing to stdout, the status-line command runs and side effects such as file writes run. Therefore **the tee works even in an operation that shows no visible bar**.
-- **Version dependence of field paths**: the key names above may change by Claude Code version. Confirm by inspecting the real environment's stdin JSON.
-- **`date` dialects**: try both GNU (`date -d @epoch`) and BSD (`date -r epoch`) for reset formatting, falling through.
-- **Path differences**: default to under `~/.claude`, but keep it overridable via environment variables.
-- **Keep the state file out of git** (volatile state local to the execution environment).
+- **The most important prerequisite (being able to see it)**: first confirm whether the target Claude Code **actually passes** `rate_limits.five_hour.used_percentage` / `resets_at` on the status-line standard input (put an echo debug into `statusLine.command`, or look at the created state file). In an environment where it is not passed (the §2.4 fallback conditions), this tool falls back to permanent `UNKNOWN` (fail-open) and the gate does not work.
+- **When the status line runs (official)**: `statusLine.command` runs **after a new assistant message, when `/compact` completes, on a permission-mode change, and on a Vim-mode toggle**, and updates are batched over 300ms. **If not set, it never runs.** These are interactive UI actions; design on the assumption that they do not run under headless/print mode (§2.4).
+- **When `rate_limits` arrives (official)**: `rate_limits` appears on standard input **after the first API response of a Claude.ai Pro/Max subscriber**. `five_hour` / `seven_day` can each be missing. It does not arrive for API-key billing users.
+- **The visible bar is independent (official)**: even if the script outputs nothing to standard output, the status-line command runs and side effects such as file writes run. So **the tee works even in a setup with no visible bar**.
+- **Field locations depend on the version**: the key names above can change with the Claude Code version. Confirm by actually looking at the real environment's standard-input JSON.
+- **`date` dialects**: try both GNU (`date -d @epoch`) and BSD (`date -r epoch`) in order for reset-time formatting.
+- **Path differences**: default to under `~/.claude`, but keep it swappable with an environment variable.
+- **Keep the state file out of git** (volatile state local to the running environment).
 
 ---
 
@@ -248,83 +248,83 @@ The implementation must satisfy the following.
 
 | # | Input | Expected |
 | --- | --- | --- |
-| 1 | Pass a normal stdin including rate_limits through the tee | A valid JSON state file is generated atomically |
-| 2 | stdin not including rate_limits (non Pro/Max, etc.) | Each value is `null` · JSON is valid |
+| 1 | Pass a normal standard input that includes rate_limits through the tee | A valid JSON state file is created in one write |
+| 2 | Standard input without rate_limits (non Pro/Max, etc.) | Each value is `null`; the JSON is valid |
 | 3 | `used_percentage=42`, threshold 80 | `VERDICT=OK` / exit 0 |
 | 4 | `used_percentage=85`, threshold 80 | `VERDICT=DEFER` / exit 10 |
-| 5 | `used_percentage=80` (boundary) | `VERDICT=DEFER` (`>=`) / exit 10 |
-| 6 | `written_at` 1200 s ago (>900) | `VERDICT=UNKNOWN` / exit 20 · REASON makes staleness explicit |
-| 7 | No state file (equivalent to status line unset) | `VERDICT=UNKNOWN` / exit 20 (fail-open) · REASON makes not-generated explicit |
+| 5 | `used_percentage=80` (equal value) | `VERDICT=DEFER` (`>=`) / exit 10 |
+| 6 | `written_at` is 1200 seconds ago (>900) | `VERDICT=UNKNOWN` / exit 20, REASON states "stale" |
+| 7 | No state file (equivalent to status line not set) | `VERDICT=UNKNOWN` / exit 20 (fail-open), REASON states "not created" |
 | 8 | `RATE_GUARD_THRESHOLD=30`, `used_percentage=42` | `VERDICT=DEFER` |
 | 9 | Run the gate against real data (after the tee fired in a real session) | OK/DEFER returns on authoritative values (smoke) |
-| 10 | Newly configure Appendix A-1 in an environment with no status line, and do one round trip interactively | The state file is generated, and the gate returns authoritative values (new-adoption smoke) |
-| 11 | Run the existing status line standalone after appending the tee | The existing rendering is unchanged (non-destructive check) |
-| 12 | `five_hour.used_percentage=null` (equivalent to non Pro/Max) | `UNKNOWN` / exit 20 · REASON makes "rate_limits absent = gate inoperative" explicit |
-| 13 | `RATE_GUARD_THRESHOLD=5` / `=99` | Misconfiguration warning to stderr · the stdout KEY=VALUE is unchanged |
-| 14 | Force the tee write to fail (permissions/disk, etc.) | The status line `exit 0`s (rendering continues) · the failure is recorded to `rate-guard.tee.log` |
-| 15 | `written_at` non-numeric (`"abc"`/decimal/hex, etc.) | `UNKNOWN` / exit 20 (contract-compliant without crashing) · REASON makes the non-numeric explicit |
+| 10 | Newly set up Appendix A-1 in an environment with no status line and do one round trip interactively | The state file is created and the gate returns authoritative values (new-adoption smoke) |
+| 11 | Run the existing status line on its own after appending the tee | The existing rendering is unchanged (non-destructive check) |
+| 12 | `five_hour.used_percentage=null` (equivalent to non Pro/Max) | `UNKNOWN` / exit 20, REASON states "rate_limits absent = gate disabled" |
+| 13 | `RATE_GUARD_THRESHOLD=5` / `=99` | A misconfiguration warning to standard error; the standard-output KEY=VALUE is unchanged |
+| 14 | Make the tee write fail (permissions/disk, etc.) | The status line `exit 0`s (rendering continues); the failure is recorded to `rate-guard.tee.log` |
+| 15 | `written_at` is not a number (`"abc"`/decimal/hex, etc.) | `UNKNOWN` / exit 20 (per the agreement without crashing), REASON states "not a number" |
 
 ---
 
-## 10. Known limitations / non-goals
+## 10. Known limits and non-goals
 
-- **Dependence on the status-line command**: the tee parasitizes on the status-line command's execution. **If unset, permanent `UNKNOWN`.** Adoption starts with configuring the Appendix A-1 command (§2.4 · §11).
-- **Interactive-session only**: the executor of the judgment/monitoring is the agent, and it works only while the session is running (`TaskStop`/`resumeFromRunId` are session-bound). **Under headless/non-interactive launch the status line does not fire and the capture goes stale**, so launch long-running WFs from an interactive session. Close the session and the monitor is gone = the mid-run watchdog (FR-08) also stops.
-- **Pro/Max only**: `rate_limits` is provided only to Claude.ai Pro/Max subscribers. Under API-key billing it is permanently `UNKNOWN` (fail-open pass-through) and this gate is inapplicable.
-- **A mid-run stop does not guarantee a phase boundary**: because the stop is an external poll, the interruption point is indeterminate. An interrupted agent re-runs on resume, so read-only WFs are harmless, but side-effecting WFs presuppose idempotency keys.
-- **Detection only, non-enforcing**: enforcement (blocking via hooks) is a separate decision (Appendix C). This document presupposes "the agent consults it itself".
+- **Depends on the status-line command**: the tee rides on the status-line command's execution. **If not set, permanent `UNKNOWN`.** Adoption starts with setting up the Appendix A-1 command (§2.4, §11).
+- **Interactive session only**: the agent runs the decision and monitoring, and they work only while the session is running (`TaskStop`/`resumeFromRunId` are tied to the session). **Under headless/non-interactive launch, the status line does not run and the copy goes stale**, so launch long-running workflows from an interactive session. Close the session and the monitor is gone, so the mid-run watchdog (FR-08) also stops.
+- **Pro/Max only**: `rate_limits` is given only to Claude.ai Pro/Max subscribers. Under API-key billing it is permanently `UNKNOWN` (passes through fail-open), and this gate cannot be used.
+- **A mid-run stop does not guarantee a boundary**: because you stop from outside, the stop point is not fixed. The interrupted agent re-runs on resume, so a read-only workflow is harmless, but one with writes presupposes an idempotency key.
+- **Detect only, no enforcement**: enforcement (blocking with a hook) is a separate decision (Appendix C). This document assumes "the agent looks at it itself".
 - **Targets scope-(i) only**: dispatcher-managed tasks are out of scope.
-- **Staleness while idle**: when rendering stops, the capture goes stale. But the gate target is a running workflow, so the real harm is small, and the freshness check (FR-04) absorbs it via UNKNOWN.
-- **Authoritative but version-dependent**: the values are server-provided (not estimates), but the stdin schema depends on the Claude Code version (§8).
+- **Goes stale while idle**: when rendering stops, the copy goes stale. But the gate's target is a running workflow, so the real harm is small, and the freshness check (FR-04) absorbs it with UNKNOWN.
+- **Authoritative but version-dependent**: the values come from the server and are not estimates, but the standard-input format depends on the Claude Code version (§8).
 
 ---
 
 ## 11. Rollout procedure (new adoption)
 
-Starting from an environment with no status line, adopt with minimal steps. If a status line already exists, read steps 2–3 as "appending the tee block".
+Starting from an environment with no status line, adopt with the fewest steps. If a status line already exists, read steps 2–3 as "appending the tee block".
 
-1. **Verify prerequisites** (§2.4 · §8): confirm whether the target is a **Pro/Max** subscriber and **used as an interactive TUI**. If neither holds, make the adopter aware it becomes permanent `UNKNOWN` (fail-open).
-2. **Place the status-line command**: put the Appendix A-1 `statusline-command.sh` under `~/.claude/` and grant execute permission (`chmod +x`).
-3. **Wire up settings.json**: point `statusLine.command` at that script (see the configuration example at the end of Appendix A-1). If a status line already exists, append only the tee block to that command and do not change the wiring.
-4. **Place the gate**: place the Appendix A-2 `rate-guard.sh` and grant execute permission.
-5. **State the behavioral contract**: write FR-06 (pre-flight) and FR-08 (mid-run watchdog) into that repo's agent memory / operating documentation.
-6. **Acceptance check**: run the §9 tests, especially #10 (new-adoption smoke), in an interactive session, and confirm state generation → the gate returns authoritative values.
+1. **Check the prerequisites** (§2.4, §8): confirm whether the target is **Pro/Max** and is **used as an interactive TUI**. If neither holds, make the adopter aware that it becomes permanent `UNKNOWN` (fail-open).
+2. **Place the status-line command**: put the Appendix A-1 `statusline-command.sh` under `~/.claude/` and give it execute permission (`chmod +x`).
+3. **Wire up settings.json**: point `statusLine.command` at that script (see the setup example at the end of Appendix A-1). If a status line already exists, append only the tee block to that command and do not change the wiring.
+4. **Place the gate**: put the Appendix A-2 `rate-guard.sh` and give it execute permission.
+5. **State the behavior rule**: write FR-06 (pre-flight) and FR-08 (mid-run watchdog) into that repository's agent memory / operating documentation.
+6. **Acceptance check**: run the §9 tests, especially #10 (new-adoption smoke), in an interactive session, and confirm that the state is created and the gate returns authoritative values.
 7. (Optional) To fully eliminate misses, consider Appendix C (enforcement hook).
 
 ---
 
-## 12. Operating promises (accident prevention)
+## 12. Operating promises (preventing accidents)
 
-Even if the gate mechanism itself is sound, mishandled operation causes accidents. Rules to keep at the adopting site.
+Even if the gate mechanism itself is sound, mishandled operation leads to accidents. Rules to keep at the adopting site.
 
-- **Prefer read-only WFs under the watchdog**: a mid-run stop does not guarantee a phase boundary, and an interrupted agent re-runs on resume. **A WF with side effects (file writes / external posting / DB updates / uploads) requires idempotency keys (`request_hash`/`batch_id`, etc.).** Do not put a WF that cannot be made idempotent on the watchdog.
-- **Make detached subprocesses self-defend**: if a WF launches an external process that does not die on `TaskStop`, **give that process itself a max run time / self-gate**. Closing the session removes the monitor (agent), so it must be able to self-terminate even with no monitor present.
-- **Fix polls at a coarse interval, and back off near the reset boundary**: every wakeup consumes tokens. To avoid monitoring itself eating the window near the cap, keep the interval in minutes, and suppress reset-estimate-drift thrash with a re-check guard + backoff (NFR-08).
-- **Leave slack for heavy single-shot WFs**: pre-flight only sees the usage rate at launch and does not know the WF's consumption. For a WF that could eat one window, **lower the threshold to secure slack** (e.g. 80→60) or switch to the **FR-08 watchdog premise**.
-- **Pass the threshold via env**: fixing a permanent change in `settings.json` etc. with a threshold below the steady-state usage rate causes **re-exceeding the threshold after reset → permanent-DEFER deadlock**. Keep threshold changes in the env at gate-call time (one-off).
+- **Under the watchdog, prefer read-only workflows**: a mid-run stop does not guarantee a boundary, and the interrupted agent re-runs on resume. **A workflow with writes (files / external posts / DB updates / uploads) must have an idempotency key (`request_hash`/`batch_id`, etc.).** Do not put a workflow that cannot be made idempotent on the watchdog.
+- **Let detached subprocesses defend themselves**: if a workflow launches an external process that does not die on `TaskStop`, **give that process its own maximum run time / self-gate**. Closing the session removes the monitor (the agent), so it must be able to stop itself even with no monitor present.
+- **Fix monitoring to a coarse interval, and back off at the reset boundary**: every wake-up uses tokens. So that monitoring itself does not eat the window near the limit, keep the interval in minutes, and suppress thrash from drift in the reset estimate with a re-check guard plus backoff (NFR-08).
+- **Leave margin for heavy single workflows**: pre-flight sees only the usage rate at launch and does not know the workflow's use. For a workflow that could eat one window, **lower the threshold to keep margin** (for example 80→60), or switch to the **FR-08 watchdog** approach.
+- **Pass the threshold through an environment variable**: fixing a permanent change in `settings.json`, etc. with a threshold below your usual usage rate means it **exceeds the threshold again after the reset and gets stuck in permanent DEFER**. Keep a threshold change in the environment variable at the gate call (one-off only).
 
 ---
 
 ## Appendix A: Reference implementation
 
-### A-1. The status-line command (`~/.claude/statusline-command.sh` · tee built in)
+### A-1. The status-line command (`~/.claude/statusline-command.sh`, with the tee built in)
 
-A self-contained script that **can be newly configured as-is** into an environment with no status line. It extracts rate_limit from stdin to write the capture (tee), and optionally renders a one-line visible bar. If you do not need the visible bar, replace the trailing "visible bar" block with `:` (a no-op) — the tee side effect keeps working.
+A self-contained script that **can be newly set up as is** in an environment with no status line. It takes rate_limit from standard input and writes the copy (tee), and optionally draws a one-line visible bar. If you do not need the visible bar, replace the trailing "visible bar" block with `:` (a no-op); the tee side effect still works.
 
 ```bash
 #!/usr/bin/env bash
-# Claude Code status-line command + rate-limit capture (tee).
+# Claude Code status-line command + rate-limit copy (tee).
 # Reads the state JSON on stdin, persists the rate-guard state, and optionally renders one line.
 input=$(cat)
 
-# --- Extract rate_limit etc. (exists only on Pro/Max; if absent → empty → nulled downstream) ---
+# --- Take rate_limit, etc. (exists only on Pro/Max; if absent, empty, then nulled downstream) ---
 five_pct=$(echo   "$input" | jq -r '.rate_limits.five_hour.used_percentage  // empty')
 five_reset=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at         // empty')
 week_pct=$(echo   "$input" | jq -r '.rate_limits.seven_day.used_percentage   // empty')
 week_reset=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at         // empty')
 used_pct=$(echo   "$input" | jq -r '.context_window.used_percentage          // empty')
 
-# --- tee: capture the rate-limit state atomically (isolated from rendering · failures leave a trace) ---
+# --- tee: copy the rate-limit state atomically (separate from rendering; a failure leaves a trace) ---
 state_file="$HOME/.claude/rate_limit_state.json"
 tee_log="$HOME/.claude/rate-guard.tee.log"
 now_epoch=$(date +%s)
@@ -342,15 +342,15 @@ if ! { jq -n \
   printf '%s tee failed (jq or mv)\n' "$(date -Is 2>/dev/null || date)" >> "$tee_log" 2>/dev/null
 fi
 
-# --- Visible bar (optional · cosmetic). If not needed, replace the next 3 lines with `:` ---
+# --- Visible bar (optional, cosmetic). If not needed, replace the next 3 lines with `:` ---
 model=$(echo "$input" | jq -r '.model.display_name // empty')
 printf '%s' "${model:+$model}"
 [ -n "$five_pct" ] && printf ' · 5h %s%%' "$five_pct"
 
-exit 0   # tee failure / short-circuit of the visible bar → non-zero exit would blank the status line; avoid it
+exit 0   # a tee failure or a short-circuit of the visible bar could exit non-zero and blank the status line; avoid it
 ```
 
-Wiring into `settings.json` (for an unconfigured environment):
+Wiring into `settings.json` (for an unset environment):
 
 ```json
 {
@@ -361,20 +361,20 @@ Wiring into `settings.json` (for an unconfigured environment):
 }
 ```
 
-> In an environment that already has a status line, do not change the wiring; append only the "tee" block above into that existing command. If the extraction (`five_pct` etc.) is undefined, append the extraction lines too.
+> In an environment that already has a status line, do not change the wiring; append only the "tee" block above into that existing command. If the extraction (`five_pct`, etc.) is not defined, append the extraction lines too.
 
-### A-2. `rate-guard.sh` (full decision script)
+### A-2. `rate-guard.sh` (the full decision script)
 
 ```bash
 #!/usr/bin/env bash
-# Pure code (no LLM) that judges whether there is "headroom to run one shot" in the 5-hour session window.
+# Code only (no LLM) that decides whether there is room to run one workflow in the 5-hour session window.
 # Output: KEY=VALUE lines / exit codes 0=OK 10=DEFER 20=UNKNOWN(fail-open)
 set -u
 THRESHOLD="${RATE_GUARD_THRESHOLD:-80}"
 STALE_SECONDS="${RATE_GUARD_STALE_SECONDS:-900}"
 STATE_FILE="${RATE_GUARD_STATE_FILE:-$HOME/.claude/rate_limit_state.json}"
 
-# Threshold sanity: outside [10,95] is suspected misconfiguration → warn to stderr (judgment continues · stdout contract unchanged)
+# Threshold sanity: outside [10,95] is a likely misconfiguration, warn to stderr (the decision continues; the stdout agreement is unchanged)
 if [ "$(awk -v t="$THRESHOLD" 'BEGIN{print (t+0<10 || t+0>95) ? 1 : 0}')" = "1" ]; then
   printf 'WARN: RATE_GUARD_THRESHOLD=%s outside [10,95]; likely misconfigured\n' "$THRESHOLD" >&2
 fi
@@ -433,40 +433,40 @@ exit 0
 
 ## Appendix B: mid-run watchdog operating procedure (FR-08 details)
 
-The procedure for completing a single workflow that exceeds one window (5h).
+The procedure for finishing a single workflow that exceeds one window (5 hours).
 
-**Substance**: not a new program, but a monitoring loop the agent runs on top of existing primitives (`rate-guard.sh` + the Workflow tool's standard `run_in_background` / `TaskStop` / `resumeFromRunId`). Because `TaskStop`/`resumeFromRunId` are session-bound, **the monitoring subject is the agent itself** (a bare cron cannot do it).
+**What it is**: not a new program, but a monitoring loop the agent runs on top of existing parts (`rate-guard.sh` plus the Workflow tool's standard `run_in_background` / `TaskStop` / `resumeFromRunId`). Because `TaskStop`/`resumeFromRunId` are tied to the session, **the agent itself does the monitoring** (a plain cron cannot).
 
-**Loop (pseudo-procedure)**:
+**Loop (outline of the procedure)**:
 
 ```
 launch:  runId = Workflow(scriptPath, run_in_background=true)
 
-poll loop (wake at a coarse interval · run rate-guard.sh each time):
-  VERDICT=OK    and running  → re-schedule the next poll
-  VERDICT=DEFER and running  → TaskStop(runId)              # the journal is preserved
-                               record RESETS_AT and reserve resume (same scheduling as FR-07)
-  completion notification    → end the loop (collect the artifacts)
+monitoring loop (wake at a coarse interval, run rate-guard.sh each time):
+  VERDICT=OK    and running  → schedule the next check
+  VERDICT=DEFER and running  → TaskStop(runId)              # the journal is kept
+                               record RESETS_AT and schedule the resume (same procedure as FR-07)
+  completion notice received → end the loop (collect the results)
 
-resume (when the reservation fires):
-  re-check rate-guard.sh → confirm OK (thrash prevention)
+resume (when the schedule fires):
+  re-check with rate-guard.sh → confirm OK (thrash prevention)
   continue with Workflow(scriptPath, resumeFromRunId=runId, run_in_background=true)
-  re-enter the poll loop (if spanning multiple windows, repeat on every DEFER)
+  return to the monitoring loop (if it spans several windows, repeat on each DEFER)
 ```
 
 **Design points**:
 
-- **The value of actively stopping at 80%**: waiting for the 100% hit means the Workflow's `agent()` is swallowed into `null` after retries and **a degraded result is returned silently** (silent truncation). A `TaskStop` at the threshold interrupts cleanly and leaves the journal, avoiding this.
-- **The stop point is indeterminate**: because of the external poll it does not stop at a phase boundary. The agent that was running at interruption re-runs on resume. **Read-only WFs (code review, etc.) are harmless.** A WF with side effects (file writes / external posting / DB updates / uploads) is limited to the range where idempotency keys (request_hash/batch_id, etc. = loose-coupling contract #4) can absorb double-firing.
-- **Resume prerequisite**: the script must be deterministic (must not depend on `Date.now()`/randomness). With the same script + same args, completed agents are 100% cache-restored.
-- **Detached subprocesses**: if the WF launches an external process, it does not die on `TaskStop`. On resume, do not re-launch but **poll an existing sentinel/lock (PID liveness)** to continue (detached+poll approach).
-- **Poll cost**: each poll is only "read state + numeric compare". Keep the interval coarse (mindful of cache retention). Near the cap, monitoring itself must not eat the window (NFR-08).
+- **The value of stopping on purpose at 80%**: if you wait for the 100% hit, the Workflow's `agent()` is swallowed into `null` after retries, and **a degraded result is returned silently** (a silent cutoff). A `TaskStop` at the threshold stops cleanly and keeps the journal, which avoids this.
+- **The stop point is not fixed**: because you monitor from outside, it does not stop at a boundary (the phase boundary). The agent that was running at the interruption re-runs on resume. **A read-only workflow (code review, etc.) is harmless.** One with writes (files / external posts / DB updates / uploads) is limited to the range where an idempotency key (request_hash/batch_id, etc. = loose-coupling agreement #4) can absorb a double fire.
+- **Resume prerequisite**: the script must be deterministic (must not depend on `Date.now()`/randomness). With the same script and same args, completed agents are restored from the cache 100%.
+- **Detached subprocesses**: if the workflow launches an external process, it does not die on `TaskStop`. On resume, do not re-launch; **monitor an existing marker/lock (the PID being alive)** to continue (the detach-plus-monitor approach).
+- **Monitoring cost**: each check is only "read the state and compare numbers". Keep the interval coarse (mindful of keeping the cache). Near the limit, monitoring itself must not eat the window (NFR-08).
 
-## Appendix C: Upgrade to enforcement (PreToolUse hook) (optional)
+## Appendix C: Upgrading to enforcement (a PreToolUse hook) (optional)
 
-Only when you want to fully eliminate misses (the agent forgetting to run the gate / recall lapses).
+Only when you want to fully eliminate misses (the agent forgetting to run the gate, or not recalling it).
 
-- A PreToolUse hook on the `Workflow` tool runs `rate-guard.sh`, and on `DEFER` blocks the tool call + returns a reason.
-- **Cost**: acts indiscriminately on all Workflow calls (lightweight calls included). A foot-gun that can fully block everything on a script bug. Exception handling needs a separate bypass mechanism (env flag · specific-label exclusion).
-- **Limitation**: what a hook can harden is only "blocking the launch". The follow-through of deferral reservation and user announcement still remains agent behavior (FR-06/07).
-- When adopting, since changing the configuration file (`hooks` in `settings.json`) = changing the behavior of all sessions, introduce it only with explicit approval.
+- A PreToolUse hook on the `Workflow` tool runs `rate-guard.sh`, and on `DEFER` it blocks the tool call and returns the reason.
+- **The cost**: it acts uniformly on every Workflow call (light calls included). A risky mechanism that a script bug could turn into a full block. Exception handling needs a separate bypass (an environment-variable flag, excluding a specific label).
+- **The limit**: what a hook can harden is only "blocking the launch". The follow-through of scheduling the deferral and notifying the user still remains in the agent's behavior (FR-06/07).
+- When you adopt it, changing the configuration file (`hooks` in `settings.json`) changes the behavior of all sessions, so introduce it only with explicit approval.

@@ -3,10 +3,13 @@ rate_limit_state.json
 *.tee.log
 *.log
 
-# Personal / local Claude Code config (keep private instructions out of the repo;
+# Personal / local Claude Code config & tooling (keep private out of the repo;
 # the public-facing template lives at examples/CLAUDE.md.snippet)
 CLAUDE.md
-.claude/settings.local.json
+.claude/
+
+# Internal development artifacts (backlog, session dev-logs — not for the public repo)
+/dev/
 
 # Secrets / environment (defensive: never publish credentials)
 .env

@@ -1,32 +1,31 @@
 <!--
 Paste this into your project's CLAUDE.md so the agent consults the guard
-before and during long-running workflows. Adjust paths/threshold to taste.
+before and during long-running workflows. Adjust paths and threshold to taste.
 -->
 
 ## Rate-limit guard (long-running workflows)
 
-Prevent a long multi-agent workflow from being silently truncated when the
-5-hour usage window runs out. The verdict comes from a pure-shell script
-(`rate-guard.sh`, no LLM, zero tokens): `VERDICT=OK|DEFER|UNKNOWN`
-(exit `0`/`10`/`20`), default threshold `RATE_GUARD_THRESHOLD=80`.
-Scope: **long-running workflows only** (one-off tool calls are exempt).
+Stop a long workflow from being silently truncated when the 5-hour usage window
+runs out. The verdict comes from a pure-shell script (`rate-guard.sh`, no LLM,
+zero tokens): `VERDICT=OK|DEFER|UNKNOWN` (exit `0`/`10`/`20`), default threshold
+`RATE_GUARD_THRESHOLD=80`. Scope: **long-running workflows only** (one-off tool
+calls are exempt).
 
 - **Pre-flight (before launching a long workflow):** run
   `bash ~/.claude/scripts/rate-guard.sh`.
-  - `OK` → launch.
-  - `DEFER` → do **not** launch. Schedule a retry just after `RESETS_AT`
-    (within an hour: a short wakeup; further out: a one-shot cron), tell the
-    user it is deferred, and re-run the guard when it fires; launch only on `OK`.
-  - `UNKNOWN` → fail-open: launch, but state that remaining budget is unknown.
+  - `OK`: launch.
+  - `DEFER`: do **not** launch. Schedule a retry just after `RESETS_AT` (within an
+    hour, a short wakeup; further out, a one-shot cron), tell the user it is
+    deferred, and re-run the guard when it fires; launch only on `OK`.
+  - `UNKNOWN`: fail-open. Launch, but state that the remaining budget is unknown.
 
-- **Mid-run watchdog (a single run that may exceed one window):** launch it in
-  the background and keep its run id. On a coarse interval, run the guard; on
-  `DEFER`, stop at a checkpoint (preserve the journal) and schedule a resume
-  after reset; when it fires and the guard says `OK`, resume from the checkpoint.
-  Repeat for each window the run spans.
+- **Mid-run watchdog (a single run that may exceed one window):** launch it in the
+  background and keep its run id. At a coarse interval, run the guard. On `DEFER`,
+  stop at a checkpoint (keep the journal) and schedule a resume after the reset.
+  When it fires and the guard says `OK`, resume from the checkpoint. Repeat for
+  each window the run spans.
 
-Why stop actively at the threshold rather than ride to 100%: at 100% the
-orchestrator's subagent calls fail and are often swallowed, silently returning
-degraded results. Stopping early keeps results complete. Stop position is
-approximate, so read-only workflows are safe to stop; side-effecting ones should
-be idempotent.
+Why stop at the threshold instead of running to 100%: at 100% the orchestrator's
+subagent calls fail and are often swallowed, so the run silently returns degraded
+results. Stopping early keeps the results complete. The stop point is approximate,
+so read-only workflows are safe to stop; ones with writes should be idempotent.
