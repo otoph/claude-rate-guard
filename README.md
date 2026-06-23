@@ -190,4 +190,4 @@ behavioral contracts and appendices:
 
 ## License
 
-[MIT](./LICENSE) © 2026 otoph
+[MIT](./LICENSE) © 2026 [otoph](https://x.com/otophotoph)

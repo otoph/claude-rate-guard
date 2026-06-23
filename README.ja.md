@@ -137,4 +137,4 @@ REASON=5h usage 37% < threshold 80%
 
 ## ライセンス
 
-[MIT](./LICENSE) © 2026 otoph
+[MIT](./LICENSE) © 2026 [otoph](https://x.com/otophotoph)
