@@ -14,9 +14,10 @@ calls are exempt).
 - **Pre-flight (before launching a long workflow):** run
   `bash ~/.claude/scripts/rate-guard.sh`.
   - `OK`: launch.
-  - `DEFER`: do **not** launch. Schedule a retry just after `RESETS_AT` (within an
-    hour, a short wakeup; further out, a one-shot cron), tell the user it is
-    deferred, and re-run the guard when it fires; launch only on `OK`.
+  - `DEFER`: do **not** launch. Schedule a retry just after `RESETS_AT`
+    (`SECONDS_TO_RESET` gives the delay directly; within an hour, a short wakeup;
+    further out, a one-shot cron), tell the user it is deferred, and re-run the
+    guard when it fires; launch only on `OK`.
   - `UNKNOWN`: fail-open. Launch, but state that the remaining budget is unknown.
 
 - **Mid-run watchdog (a single run that may exceed one window):** launch it in the

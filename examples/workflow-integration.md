@@ -28,12 +28,12 @@ esac
 
 ## 2. Scheduling a resume after `DEFER`
 
-`RESETS_AT` is a Unix epoch. To resume right after the window resets:
+`SECONDS_TO_RESET` is the wait the gate already computed, so you do not need the
+local clock. To resume right after the window resets:
 
 ```sh
-resets_at="$(rate-guard.sh | awk -F= '/^RESETS_AT=/{print $2}')"
-now="$(date +%s)"
-sleep $(( resets_at - now + 120 ))   # 2-minute cushion
+secs="$(rate-guard.sh | awk -F= '/^SECONDS_TO_RESET=/{print $2}')"
+sleep $(( secs + 120 ))   # 2-minute cushion
 rate-guard.sh >/dev/null && ./run-long-job.sh   # re-check, then launch
 ```
 

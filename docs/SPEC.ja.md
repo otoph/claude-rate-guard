@@ -5,7 +5,7 @@
 | 文書ID   | SPEC-RATEGUARD-001                                                     |
 | 想定読者 | 設計者 / 実装するエージェント / 各リポジトリへの導入担当者              |
 | 適用範囲 | **特定のリポジトリに依存しない**（他のリポジトリにも展開する前提）。Claude Code 上で動く任意のリポジトリに移せる。**statusline をまだ設定していない環境にも新しく導入できる**ことを前提に書く |
-| 前提環境 | Claude Code（statusline の仕組みと Workflow ツールを持つ版）。`bash` / `jq` / `awk` / `date` が使えること。**`rate_limits` の取得には Claude.ai Pro/Max プランが必要**（§2.4）。**エージェントに現在時刻を毎ターン渡す手段**（例：`UserPromptSubmit` フックで時刻を渡す）。FR-07/08 の予約・通知が時刻に依存するため（§2.4・§8） |
+| 前提環境 | Claude Code（statusline の仕組みと Workflow ツールを持つ版）。`bash` / `jq` / `awk` / `date` が使えること。**`rate_limits` の取得には Claude.ai Pro/Max プランが必要**（§2.4）。エージェントに現在時刻を毎ターン渡す手段（例：`UserPromptSubmit` フックで時刻を渡す）は、FR-07/08 の実時刻の通知に**推奨**（予約自体はゲートの `SECONDS_TO_RESET` でまかなえる・§2.4・§8） |
 
 ---
 
@@ -61,10 +61,10 @@
 | **headless / 非対話起動**（`claude -p`・SDK・非対話 cron） | state が更新されず古くなる → `UNKNOWN` | statusline は対話 UI の操作でしか動かない。**長時間ワークフローは対話セッションから起動する**こと。headless の常用は対象外 |
 | **API キー課金（非 Pro/Max）** | `rate_limits` 自体が標準入力に来ない → 恒久 `UNKNOWN` | このゲートは使えない。安全側に倒して素通りし、枠切れ自体はハーネスの rate-limit エラーが最後の歯止めになる |
 | 初回 API 応答前 | 一時 `UNKNOWN` | 1往復すれば解消（恒久ではない） |
-| **エージェントに現在時刻が渡らない**（時刻を渡すフックなどが無い） | ゲートの OK/DEFER 自体は正常（ゲートは shell の `date` を使う）。ただし **FR-07/08 の DEFER／再開の予約が確実に行えない**：エージェントは待ち時間を計算する「今」を持たず、捏造する恐れがある | **FR-07/08 を使うなら必須。** `UserPromptSubmit` などで毎ターン現在時刻を渡す（§8） |
+| **エージェントに現在時刻が渡らない**（時刻を渡すフックなどが無い） | OK/DEFER は正常で、DEFER／再開の予約も動く：エージェントはゲートの `SECONDS_TO_RESET` を待ち時間に使う。影響するのは、エージェントが自分の言葉で実時刻を述べる部分だけ | **推奨だが必須ではない。** 通知の見栄えと妥当性確認のため `UserPromptSubmit` などで現在時刻を渡す（§8） |
 
 - 切り替わりは全て **安全側（止めない）** なので「壊れはしない」が、「守っているつもりで守っていない」状態は危険である。NFR-07 のとおり、`UNKNOWN` は必ず `REASON` で見えるようにする。
-- **時刻の把握は、ゲートの判定ではなく、エージェントの動作（FR-06/07/08）の前提である**。判定自体はコードの `date` で成り立つが、先送りの予約には「今」が要る（無いと捏造して誤った再開時刻を入れる恐れがある）。
+- **時刻の把握はエージェントの動作（FR-06/07/08）の助けになるが、ゲートのフローには必須でない**。ゲートが判定（shell の `date`）と待ち時間（`SECONDS_TO_RESET`）の両方を出すので、エージェントは自分の時計が無くても予約できる。現在時刻の取得は、実時刻の通知や妥当性確認のために推奨。
 - `rate_limits` は **Claude.ai Pro/Max 利用者の初回 API 応答後にのみ** 標準入力に現れ、`five_hour` / `seven_day` はそれぞれ欠けることがある（§8・公式スキーマに準拠）。
 
 ---
@@ -141,7 +141,7 @@
   - `used_percentage < しきい値` → `VERDICT=OK`、exit **0**
   - `used_percentage >= しきい値` → `VERDICT=DEFER`、exit **10**（同じ値のときは DEFER 側）
   - 材料が欠ける or 古い → `VERDICT=UNKNOWN`、exit **20**
-- **出力は機械が読める `KEY=VALUE` 行**（標準出力）：`VERDICT` / `FIVE_HOUR_PCT` / `RESETS_AT` / `RESETS_AT_HUMAN` / `REASON`。
+- **出力は機械が読める `KEY=VALUE` 行**（標準出力）：`VERDICT` / `FIVE_HOUR_PCT` / `RESETS_AT` / `RESETS_AT_HUMAN` / `SECONDS_TO_RESET` / `REASON`。`SECONDS_TO_RESET` は実行時にゲートが算出する `RESETS_AT − now`（リセット時刻が不明なら空、すでに過ぎていれば負値）。エージェントは自分の時計が無くても、この値で再開を予約できる。
 - 小数の比較は `awk` などで行う（bash の整数比較に丸めない）。
 - **LLM を一切使わない**（判定と計算はコードで行う）。
 - **しきい値の妥当性チェック**：`RATE_GUARD_THRESHOLD` が妥当な範囲 `[10,95]` を外れたら **標準エラーに警告** する（設定ミスの検知）。判定は続け、**標準出力の KEY=VALUE は汚さない**。上げすぎ＝無防備、下げすぎ＝恒久 DEFER で詰む、の両方に早く気づけるようにする。
@@ -183,7 +183,7 @@ scope-(i) で **1本まるごと回る長時間ワークフローを起動する
 - 起動の予約時刻は `RESETS_AT`（＋少しの余白）。
 - リセットまで **1時間以内** なら短時間スリープ系（例：`ScheduleWakeup`、最大 3600 秒）。**それ以上** なら一回限りの cron（例：`CronCreate`）かスリープの連鎖。
 - **再開時の再確認**：予約が発火したら、起動の直前にもう一度ゲートを実行し、`OK` を確認してから起動する（リセット推定のずれによる、すぐの再枠切れ＝thrash を防ぐ）。
-- **現在時刻の把握が必須（本節を使う場合）**：`RESETS_AT` は絶対時刻の epoch なので、再開を予約するにはエージェントが待ち時間を `RESETS_AT − now` で計算する必要があり、「1時間以内か超か」の分岐にも `now` が要る。既定のエージェントは時計を持たず、現在時刻が無いと正しく予約できず、`now` を捏造して誤った再開時刻を入れる恐れがある（早すぎれば即再 DEFER＝thrash、遅すぎれば枠を無駄にする）。現在時刻を毎ターン渡す手段（例：`UserPromptSubmit` フック）を FR-07/08 の前提条件とする（§2.4・§8）。なお `RESETS_AT_HUMAN` はゲートが整形して出力済みのため、絶対時刻の通知自体は時計に依存しない（待ち時間の計算が依存する）。
+- **`SECONDS_TO_RESET` を使う。現在時刻は推奨であって必須ではない**：ゲートが `SECONDS_TO_RESET`（実行時に `RESETS_AT − now` で算出した待ち時間）を出力するので、エージェントは自分の時計が無くても、この値で再開を予約でき、「1時間以内か超か」の分岐（`< 3600` か否か）も判断できる。値は時間とともに古くなるため、ゲート実行後すみやかに予約すること。現在時刻を毎ターン渡す手段（例：`UserPromptSubmit` フック）は、自分の言葉で実時刻を伝える場合や妥当性確認には引き続き推奨だが、予約自体には不要であり、`now` 捏造のリスクも消える（§2.4・§8）。
 
 ### FR-08 mid-run watchdog（1つの枠を超える単発ワークフローをやり切る）
 
@@ -221,7 +221,7 @@ pre-flight（FR-06）は「残りが少ないときに *始めない*」だけ�
 ## 7. インターフェースの取り決め（壊してはいけない約束）
 
 1. **state ファイルの形式**（FR-02）。キー名・`written_at` の epoch 秒・`null` 許容を変えない。
-2. **ゲートの標準出力の取り決め**：`KEY=VALUE` 行・キー名 `VERDICT/FIVE_HOUR_PCT/RESETS_AT/RESETS_AT_HUMAN/REASON`。
+2. **ゲートの標準出力の取り決め**：`KEY=VALUE` 行・キー名 `VERDICT/FIVE_HOUR_PCT/RESETS_AT/RESETS_AT_HUMAN/SECONDS_TO_RESET/REASON`。キーの**追加**は可（既存キー名は変えない）。
 3. **終了コード**：`0=OK / 10=DEFER / 20=UNKNOWN`。呼び出し側はこのコードで分岐してよい。
 4. データの流れは一方向（§4）。ゲートは state を **読み取り専用** とし、書き換えない。
 
@@ -261,6 +261,7 @@ pre-flight（FR-06）は「残りが少ないときに *始めない*」だけ�
 | 13 | `RATE_GUARD_THRESHOLD=5` / `=99` | 標準エラーに設定ミスの警告・標準出力の KEY=VALUE は変わらない |
 | 14 | tee の書き込みを失敗させる（権限/ディスクなど） | statusline は `exit 0`（描画は続く）・`rate-guard.tee.log` に失敗を記録 |
 | 15 | `written_at` が数値でない（`"abc"`/小数/16進など） | `UNKNOWN` / exit 20（クラッシュせず取り決めどおり）・REASON に「数値でない」を明示 |
+| 16 | 未来の `resets_at` を含む実 state | `SECONDS_TO_RESET` が出力され `RESETS_AT − now` に一致（リセット時刻が無ければ空、すでに過ぎていれば負値） |
 
 ---
 
@@ -377,52 +378,60 @@ if [ "$(awk -v t="$THRESHOLD" 'BEGIN{print (t+0<10 || t+0>95) ? 1 : 0}')" = "1" 
   printf 'WARN: RATE_GUARD_THRESHOLD=%s outside [10,95]; likely misconfigured\n' "$THRESHOLD" >&2
 fi
 
+now=$(date +%s)
 emit() { printf '%s\n' "$@"; }
 fmt_reset() {
   local epoch="$1"
   [ -z "$epoch" ] && { echo ""; return; }
   date -d "@${epoch}" "+%m/%d %H:%M" 2>/dev/null || date -r "${epoch}" "+%m/%d %H:%M" 2>/dev/null
 }
+# リセットまでの残り秒（reset が整数のときのみ算出。負値＝リセット時刻は既に過去）。
+secs_to_reset() {
+  case "$1" in
+    ''|*[!0-9]*) echo "" ;;
+    *) echo "$(( $1 - now ))" ;;
+  esac
+}
 
 if [ ! -f "$STATE_FILE" ]; then
-  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "RESETS_AT=" "RESETS_AT_HUMAN=" \
+  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "RESETS_AT=" "RESETS_AT_HUMAN=" "SECONDS_TO_RESET=" \
        "REASON=state file not found ($STATE_FILE); statusLine.command unset or tee not run yet"
   exit 20
 fi
 
-now=$(date +%s)
 written=$(jq -r '.written_at // empty' "$STATE_FILE" 2>/dev/null)
 pct=$(jq -r '.five_hour.used_percentage // empty' "$STATE_FILE" 2>/dev/null)
 reset=$(jq -r '.five_hour.resets_at // empty' "$STATE_FILE" 2>/dev/null)
 reset_h=$(fmt_reset "$reset")
+secs=$(secs_to_reset "$reset")
 
 case "$written" in
   ''|*[!0-9]*)
-    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" \
+    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
          "REASON=state malformed (written_at missing or non-numeric); statusline tee may be broken (see ~/.claude/rate-guard.tee.log)"
     exit 20 ;;
 esac
 if [ -z "$pct" ]; then
-  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" \
+  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
        "REASON=rate_limits absent (five_hour.used_percentage null); non Pro/Max or before first API response -- gate inoperative here"
   exit 20
 fi
 
 age=$(( now - written ))
 if [ "$age" -gt "$STALE_SECONDS" ]; then
-  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" \
+  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
        "REASON=state stale (${age}s > ${STALE_SECONDS}s); if mid-session the statusline tee may be broken (see ~/.claude/rate-guard.tee.log)"
   exit 20
 fi
 
 over=$(awk -v p="$pct" -v t="$THRESHOLD" 'BEGIN{print (p+0 >= t+0) ? 1 : 0}')
 if [ "$over" = "1" ]; then
-  emit "VERDICT=DEFER" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" \
+  emit "VERDICT=DEFER" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
        "REASON=5h usage ${pct}% >= threshold ${THRESHOLD}%; defer launch until reset"
   exit 10
 fi
 
-emit "VERDICT=OK" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" \
+emit "VERDICT=OK" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
      "REASON=5h usage ${pct}% < threshold ${THRESHOLD}%"
 exit 0
 ```

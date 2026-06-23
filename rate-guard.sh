@@ -12,51 +12,60 @@ if [ "$(awk -v t="$THRESHOLD" 'BEGIN{print (t+0<10 || t+0>95) ? 1 : 0}')" = "1" 
   printf 'WARN: RATE_GUARD_THRESHOLD=%s outside [10,95]; likely misconfigured\n' "$THRESHOLD" >&2
 fi
 
+now=$(date +%s)
 emit() { printf '%s\n' "$@"; }
 fmt_reset() {
   local epoch="$1"
   [ -z "$epoch" ] && { echo ""; return; }
   date -d "@${epoch}" "+%m/%d %H:%M" 2>/dev/null || date -r "${epoch}" "+%m/%d %H:%M" 2>/dev/null
 }
+# リセットまでの残り秒（reset が整数のときのみ算出。負値＝リセット時刻は既に過去）。
+# エージェントはこの値で再開の遅延を直接予約でき、自前の現在時刻を持たずに済む。
+secs_to_reset() {
+  case "$1" in
+    ''|*[!0-9]*) echo "" ;;
+    *) echo "$(( $1 - now ))" ;;
+  esac
+}
 
 if [ ! -f "$STATE_FILE" ]; then
-  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "RESETS_AT=" "RESETS_AT_HUMAN=" \
+  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "RESETS_AT=" "RESETS_AT_HUMAN=" "SECONDS_TO_RESET=" \
        "REASON=state file not found ($STATE_FILE); statusLine.command unset or tee not run yet"
   exit 20
 fi
 
-now=$(date +%s)
 written=$(jq -r '.written_at // empty' "$STATE_FILE" 2>/dev/null)
 pct=$(jq -r '.five_hour.used_percentage // empty' "$STATE_FILE" 2>/dev/null)
 reset=$(jq -r '.five_hour.resets_at // empty' "$STATE_FILE" 2>/dev/null)
 reset_h=$(fmt_reset "$reset")
+secs=$(secs_to_reset "$reset")
 
 case "$written" in
   ''|*[!0-9]*)
-    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" \
+    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
          "REASON=state malformed (written_at missing or non-numeric); statusline tee may be broken (see ~/.claude/rate-guard.tee.log)"
     exit 20 ;;
 esac
 if [ -z "$pct" ]; then
-  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" \
+  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
        "REASON=rate_limits absent (five_hour.used_percentage null); non Pro/Max or before first API response -- gate inoperative here"
   exit 20
 fi
 
 age=$(( now - written ))
 if [ "$age" -gt "$STALE_SECONDS" ]; then
-  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" \
+  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
        "REASON=state stale (${age}s > ${STALE_SECONDS}s); if mid-session the statusline tee may be broken (see ~/.claude/rate-guard.tee.log)"
   exit 20
 fi
 
 over=$(awk -v p="$pct" -v t="$THRESHOLD" 'BEGIN{print (p+0 >= t+0) ? 1 : 0}')
 if [ "$over" = "1" ]; then
-  emit "VERDICT=DEFER" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" \
+  emit "VERDICT=DEFER" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
        "REASON=5h usage ${pct}% >= threshold ${THRESHOLD}%; defer launch until reset"
   exit 10
 fi
 
-emit "VERDICT=OK" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" \
+emit "VERDICT=OK" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
      "REASON=5h usage ${pct}% < threshold ${THRESHOLD}%"
 exit 0
