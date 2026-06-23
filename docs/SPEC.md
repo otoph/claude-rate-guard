@@ -5,7 +5,7 @@
 | Document ID | SPEC-RATEGUARD-001 |
 | Intended readers | Designers / implementing agents / adopters in each repository |
 | Scope | **Not tied to a specific repository** (meant to be rolled out to other repositories too). It can be moved to any repository that runs under Claude Code. Written on the assumption that it can also be **newly installed in an environment that has no status line set up yet**. |
-| Prerequisites | Claude Code (a version that has the status-line mechanism and the Workflow tool). `bash` / `jq` / `awk` / `date` must be available. **Reading `rate_limits` requires a Claude.ai Pro/Max plan** (§2.4). **A way to give the agent the current time each turn** (for example, passing the time through a `UserPromptSubmit` hook), because the scheduling and notifications in FR-07/08 depend on time (§2.4, §8). |
+| Prerequisites | Claude Code (a version that has the status-line mechanism and the Workflow tool). `bash` / `jq` / `awk` / `date` must be available. **Reading `rate_limits` requires a Claude.ai Pro/Max plan** (§2.4). Giving the agent the current time each turn (for example, through a `UserPromptSubmit` hook) is **recommended** for the FR-07/08 wall-clock notifications; the gate's `SECONDS_TO_RESET` covers the scheduling itself (§2.4, §8). |
 
 > 日本語の原典は [`SPEC.ja.md`](./SPEC.ja.md)。
 
@@ -63,10 +63,10 @@ For this gate to work on authoritative values (return `OK`/`DEFER`), the **targe
 | **headless / non-interactive launch** (`claude -p`, SDK, non-interactive cron) | The state is not updated and goes stale, so `UNKNOWN` | The status line runs only on interactive UI actions. **Launch long-running workflows from an interactive session.** Routine headless use is out of scope |
 | **API-key billing (non Pro/Max)** | `rate_limits` itself never reaches standard input, so permanent `UNKNOWN` | This gate cannot be used. It passes through on the safe side, and the harness's rate-limit error is the last stop for the window running out |
 | Before the first API response | Temporary `UNKNOWN` | Fixed after one round trip (not permanent) |
-| **The agent is not given the current time** (no time-passing hook, etc.) | The gate's OK/DEFER itself is normal (the gate uses the shell's `date`), but **the DEFER/resume scheduling in FR-07/08 cannot be done reliably**: the agent has no `now` to compute the wait, and may fabricate it | **Required for FR-07/08.** Pass the current time each turn with `UserPromptSubmit`, etc. (§8) |
+| **The agent is not given the current time** (no time-passing hook, etc.) | OK/DEFER is normal, and DEFER/resume scheduling still works: the agent uses the gate's `SECONDS_TO_RESET` for the wait. Only wall-clock statements in the agent's own words are affected | **Recommended, not required.** Pass the current time with `UserPromptSubmit`, etc. for nicer notifications and a sanity check (§8) |
 
 - Every fallback is on the **safe side (does not block)**, so "it will not break", but "thinking you are protected when you are not" is dangerous. As in NFR-07, always make `UNKNOWN` visible through `REASON`.
-- **Knowing the time is a prerequisite of the agent's behavior (FR-06/07/08), not of the gate decision.** The decision itself holds with the shell's `date`, but scheduling the deferral needs the agent to know `now` (otherwise it may fabricate it and schedule the resume wrong).
+- **Knowing the time helps the agent's behavior (FR-06/07/08) but is not required for the gate flow.** The gate provides both the decision (shell `date`) and the wait (`SECONDS_TO_RESET`), so the agent can schedule without its own clock. Current-time injection stays recommended for wall-clock notifications and a sanity check.
 - `rate_limits` appears on standard input **only after the first API response of a Claude.ai Pro/Max subscriber**, and `five_hour` / `seven_day` can each be missing (§8, per the official schema).
 
 ---
@@ -143,7 +143,7 @@ Default path: `~/.claude/rate_limit_state.json`.
   - `used_percentage < threshold` → `VERDICT=OK`, exit **0**
   - `used_percentage >= threshold` → `VERDICT=DEFER`, exit **10** (an equal value is on the DEFER side)
   - material missing or stale → `VERDICT=UNKNOWN`, exit **20**
-- **The output is machine-readable `KEY=VALUE` lines** (standard output): `VERDICT` / `FIVE_HOUR_PCT` / `RESETS_AT` / `RESETS_AT_HUMAN` / `REASON`.
+- **The output is machine-readable `KEY=VALUE` lines** (standard output): `VERDICT` / `FIVE_HOUR_PCT` / `RESETS_AT` / `RESETS_AT_HUMAN` / `SECONDS_TO_RESET` / `REASON`. `SECONDS_TO_RESET` is `RESETS_AT - now` computed by the gate at run time (empty if the reset time is unknown, negative if it has already passed); an agent can schedule a resume from it without its own clock.
 - Compare decimals with `awk`, etc. (do not round to a bash integer comparison).
 - **Use no LLM at all** (decision and calculation are done in code).
 - **Threshold validity check**: if `RATE_GUARD_THRESHOLD` is outside the valid range `[10,95]`, **warn to standard error** (to catch a misconfiguration). Continue the decision and **do not pollute the standard-output KEY=VALUE**. This makes both "set too high (defenseless)" and "set too low (stuck in permanent DEFER)" noticeable early.
@@ -185,7 +185,7 @@ In scope-(i), run the gate **right before launching a long-running workflow that
 - The scheduled launch time is `RESETS_AT` (plus a small margin).
 - If the reset is **within 1 hour**, use a short sleep mechanism (for example `ScheduleWakeup`, up to 3600 seconds). If it is **further out**, use a one-shot cron (for example `CronCreate`) or a chain of sleeps.
 - **Re-check at resume**: after the schedule fires, run the gate once more right before launch and confirm `OK` before launching (this prevents an immediate re-hit from drift in the reset estimate, which is thrash).
-- **The agent must know the current time (required for this section)**: `RESETS_AT` is an absolute epoch, so to schedule the resume the agent has to compute the wait as `RESETS_AT - now`, and the "within 1 hour or beyond" branch also needs `now`. A default agent has no clock; without the current time it cannot schedule correctly and may fabricate `now`, producing a wrong resume time (too early causes an immediate re-DEFER, that is thrash; too late wastes the window). Passing the current time each turn (for example, through a `UserPromptSubmit` hook) is a condition for FR-07/08 to work (§2.4, §8). (The gate already prints `RESETS_AT_HUMAN`, so stating the absolute reset time does not need the agent's clock; computing the wait does.)
+- **Use `SECONDS_TO_RESET`; the current time is recommended, not required**: the gate prints `SECONDS_TO_RESET` (the wait, computed as `RESETS_AT - now` at gate run time), so the agent can schedule the resume from it directly and decide the "within 1 hour or beyond" branch (`< 3600` or not) without its own clock. Schedule promptly after running the gate, because the value ages. Injecting the current time each turn (for example, through a `UserPromptSubmit` hook) is still recommended for stating wall-clock times in the agent's own words and as a sanity check, but it is no longer needed to schedule, which removes the fabricated-`now` risk (§2.4, §8).
 
 ### FR-08 mid-run watchdog (finishing a single workflow that exceeds one window)
 
@@ -223,7 +223,7 @@ Pre-flight (FR-06) only "does not start when little is left"; it **cannot save a
 ## 7. The interface agreement (promises you must not break)
 
 1. **The state-file format** (FR-02). Do not change the key names, the epoch seconds of `written_at`, or the allowance of `null`.
-2. **The gate's standard-output agreement**: `KEY=VALUE` lines, key names `VERDICT/FIVE_HOUR_PCT/RESETS_AT/RESETS_AT_HUMAN/REASON`.
+2. **The gate's standard-output agreement**: `KEY=VALUE` lines, key names `VERDICT/FIVE_HOUR_PCT/RESETS_AT/RESETS_AT_HUMAN/SECONDS_TO_RESET/REASON`. New keys may be added (additive), but existing key names must not change.
 3. **Exit codes**: `0=OK / 10=DEFER / 20=UNKNOWN`. The caller may branch on these codes.
 4. The data flow is one-directional (§4). The gate treats the state as **read-only** and does not rewrite it.
 
@@ -263,6 +263,7 @@ The implementation must satisfy the following.
 | 13 | `RATE_GUARD_THRESHOLD=5` / `=99` | A misconfiguration warning to standard error; the standard-output KEY=VALUE is unchanged |
 | 14 | Make the tee write fail (permissions/disk, etc.) | The status line `exit 0`s (rendering continues); the failure is recorded to `rate-guard.tee.log` |
 | 15 | `written_at` is not a number (`"abc"`/decimal/hex, etc.) | `UNKNOWN` / exit 20 (per the agreement without crashing), REASON states "not a number" |
+| 16 | Real state with a future `resets_at` | `SECONDS_TO_RESET` is printed and equals `RESETS_AT - now` (empty when the reset time is absent, negative when it has already passed) |
 
 ---
 
@@ -379,52 +380,61 @@ if [ "$(awk -v t="$THRESHOLD" 'BEGIN{print (t+0<10 || t+0>95) ? 1 : 0}')" = "1" 
   printf 'WARN: RATE_GUARD_THRESHOLD=%s outside [10,95]; likely misconfigured\n' "$THRESHOLD" >&2
 fi
 
+now=$(date +%s)
 emit() { printf '%s\n' "$@"; }
 fmt_reset() {
   local epoch="$1"
   [ -z "$epoch" ] && { echo ""; return; }
   date -d "@${epoch}" "+%m/%d %H:%M" 2>/dev/null || date -r "${epoch}" "+%m/%d %H:%M" 2>/dev/null
 }
+# Seconds until the reset (computed only when reset is an integer; negative = the reset time is already past).
+# The agent can schedule the resume delay from this directly, without its own clock.
+secs_to_reset() {
+  case "$1" in
+    ''|*[!0-9]*) echo "" ;;
+    *) echo "$(( $1 - now ))" ;;
+  esac
+}
 
 if [ ! -f "$STATE_FILE" ]; then
-  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "RESETS_AT=" "RESETS_AT_HUMAN=" \
+  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "RESETS_AT=" "RESETS_AT_HUMAN=" "SECONDS_TO_RESET=" \
        "REASON=state file not found ($STATE_FILE); statusLine.command unset or tee not run yet"
   exit 20
 fi
 
-now=$(date +%s)
 written=$(jq -r '.written_at // empty' "$STATE_FILE" 2>/dev/null)
 pct=$(jq -r '.five_hour.used_percentage // empty' "$STATE_FILE" 2>/dev/null)
 reset=$(jq -r '.five_hour.resets_at // empty' "$STATE_FILE" 2>/dev/null)
 reset_h=$(fmt_reset "$reset")
+secs=$(secs_to_reset "$reset")
 
 case "$written" in
   ''|*[!0-9]*)
-    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" \
+    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
          "REASON=state malformed (written_at missing or non-numeric); statusline tee may be broken (see ~/.claude/rate-guard.tee.log)"
     exit 20 ;;
 esac
 if [ -z "$pct" ]; then
-  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" \
+  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
        "REASON=rate_limits absent (five_hour.used_percentage null); non Pro/Max or before first API response -- gate inoperative here"
   exit 20
 fi
 
 age=$(( now - written ))
 if [ "$age" -gt "$STALE_SECONDS" ]; then
-  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" \
+  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
        "REASON=state stale (${age}s > ${STALE_SECONDS}s); if mid-session the statusline tee may be broken (see ~/.claude/rate-guard.tee.log)"
   exit 20
 fi
 
 over=$(awk -v p="$pct" -v t="$THRESHOLD" 'BEGIN{print (p+0 >= t+0) ? 1 : 0}')
 if [ "$over" = "1" ]; then
-  emit "VERDICT=DEFER" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" \
+  emit "VERDICT=DEFER" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
        "REASON=5h usage ${pct}% >= threshold ${THRESHOLD}%; defer launch until reset"
   exit 10
 fi
 
-emit "VERDICT=OK" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" \
+emit "VERDICT=OK" "FIVE_HOUR_PCT=${pct}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
      "REASON=5h usage ${pct}% < threshold ${THRESHOLD}%"
 exit 0
 ```

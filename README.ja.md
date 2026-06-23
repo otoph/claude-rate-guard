@@ -44,7 +44,7 @@ flowchart TD
 - `statusLine.command` を設定できる **Claude Code**。
 - **Claude.ai Pro/Max プラン**。`rate_limits` はこれらのプランでのみステータス行に渡されます。無い場合は `UNKNOWN`（fail-open）を返します。
 - **`jq` / `awk` / `date`**（GNU・BSD どちらの `date` でも動きます）。
-- **毎ターンの現在時刻**（`DEFER`／再開フロー（FR-07/08）を使う場合は必須）。既定のエージェントは時計を持ちません。state ファイルのリセット時刻は**絶対値の epoch** なので、再開を予約するには「今」を使って待ち時間（`RESETS_AT − now`）を計算する必要があります。現在時刻が無いと予約が不確実になり、エージェントが「今」を捏造して誤った再開時刻を入れる恐れがあります。`UserPromptSubmit` フックなどで毎ターン渡してください（判定 `OK`／`DEFER` 自体は無くても動きます）。
+- **毎ターンの現在時刻**（`DEFER`／再開フロー（FR-07/08）を使う場合に推奨。必須ではありません）。ゲートが `SECONDS_TO_RESET`（リセットまでの残り秒）を出力するので、エージェントは自分の時計が無くても、この値だけで再開を予約できます。現在時刻の取得（例：`UserPromptSubmit` フック）は、自分の言葉で実時刻を伝える場合や妥当性確認には有用ですが、予約自体には不要です。
 
 ---
 
@@ -84,7 +84,7 @@ flowchart TD
 | `DEFER`   | `10` | 利用率がしきい値以上。起動**しない**でリセットを待つ |
 | `UNKNOWN` | `20` | state が無い・古い・不完全。**fail-open**（起動するが、残量が不明であることを伝える） |
 
-出力するキー：`VERDICT` / `FIVE_HOUR_PCT` / `RESETS_AT`（epoch）/ `RESETS_AT_HUMAN` / `REASON`。
+出力するキー：`VERDICT` / `FIVE_HOUR_PCT` / `RESETS_AT`（epoch）/ `RESETS_AT_HUMAN` / `SECONDS_TO_RESET` / `REASON`。`SECONDS_TO_RESET` はリセットまでの残り秒で、ゲートが `RESETS_AT − now` で算出します。エージェントは自分の現在時刻を知らなくても、この値で再開を予約できます（リセット時刻が不明なら空、すでに過ぎていれば負値）。
 
 ```sh
 $ rate-guard.sh
@@ -92,6 +92,7 @@ VERDICT=OK
 FIVE_HOUR_PCT=37
 RESETS_AT=1782200400
 RESETS_AT_HUMAN=06/23 16:40
+SECONDS_TO_RESET=4853
 REASON=5h usage 37% < threshold 80%
 ```
 

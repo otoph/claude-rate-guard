@@ -62,13 +62,12 @@ step is required. `rate-guard.sh` itself never calls any API.
 - A **Claude.ai Pro/Max subscription**. `rate_limits` is passed to the status
   line only on these plans. Without it, the guard returns `UNKNOWN` (fail-open).
 - **`jq`, `awk`, `date`** (both GNU and BSD `date` are handled).
-- **The current time, each turn** — required if you use the `DEFER`/resume flow
-  (FR-07/08). A default agent has no clock, and the state file gives the reset time
-  as an absolute epoch, so to schedule a resume the agent must compute the wait as
-  `RESETS_AT - now`. Without the current time it cannot schedule reliably and may
-  fabricate "now", producing a wrong resume time. Inject it each turn, for example
-  through a `UserPromptSubmit` hook. (The `OK`/`DEFER` verdict itself works without
-  this.)
+- **The current time, each turn** — recommended for the `DEFER`/resume flow
+  (FR-07/08), but no longer required. The gate prints `SECONDS_TO_RESET` (the wait
+  until the reset), so an agent can schedule a resume from that alone, without its
+  own clock. Injecting the current time (for example through a `UserPromptSubmit`
+  hook) is still useful for stating wall-clock times in your own words and as a
+  sanity check, but it is not needed to schedule.
 
 ---
 
@@ -123,7 +122,10 @@ sends nothing over the network, so there is nothing else to clean up.
 | `UNKNOWN` | `20` | state is missing, stale, or incomplete; **fail-open**: proceed, but flag that the remaining budget is unknown |
 
 Keys printed: `VERDICT`, `FIVE_HOUR_PCT`, `RESETS_AT` (epoch), `RESETS_AT_HUMAN`,
-`REASON`.
+`SECONDS_TO_RESET`, `REASON`. `SECONDS_TO_RESET` is the wait until the reset,
+computed by the gate (`RESETS_AT - now`), so an agent can schedule a resume from
+it without knowing the current time (empty if the reset time is unknown, negative
+if it has already passed).
 
 ```sh
 $ rate-guard.sh
@@ -131,6 +133,7 @@ VERDICT=OK
 FIVE_HOUR_PCT=37
 RESETS_AT=1782200400
 RESETS_AT_HUMAN=06/23 16:40
+SECONDS_TO_RESET=4853
 REASON=5h usage 37% < threshold 80%
 ```
 
