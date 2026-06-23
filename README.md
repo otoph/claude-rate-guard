@@ -62,9 +62,13 @@ step is required. `rate-guard.sh` itself never calls any API.
 - A **Claude.ai Pro/Max subscription**. `rate_limits` is passed to the status
   line only on these plans. Without it, the guard returns `UNKNOWN` (fail-open).
 - **`jq`, `awk`, `date`** (both GNU and BSD `date` are handled).
-- To act on `DEFER` (to schedule a resume), the agent needs **the current time
-  each turn** (for example, injected through a `UserPromptSubmit` hook), because
-  the reset time is stored as an epoch in the state file.
+- **The current time, each turn** — required if you use the `DEFER`/resume flow
+  (FR-07/08). A default agent has no clock, and the state file gives the reset time
+  as an absolute epoch, so to schedule a resume the agent must compute the wait as
+  `RESETS_AT - now`. Without the current time it cannot schedule reliably and may
+  fabricate "now", producing a wrong resume time. Inject it each turn, for example
+  through a `UserPromptSubmit` hook. (The `OK`/`DEFER` verdict itself works without
+  this.)
 
 ---
 

@@ -63,10 +63,10 @@ For this gate to work on authoritative values (return `OK`/`DEFER`), the **targe
 | **headless / non-interactive launch** (`claude -p`, SDK, non-interactive cron) | The state is not updated and goes stale, so `UNKNOWN` | The status line runs only on interactive UI actions. **Launch long-running workflows from an interactive session.** Routine headless use is out of scope |
 | **API-key billing (non Pro/Max)** | `rate_limits` itself never reaches standard input, so permanent `UNKNOWN` | This gate cannot be used. It passes through on the safe side, and the harness's rate-limit error is the last stop for the window running out |
 | Before the first API response | Temporary `UNKNOWN` | Fixed after one round trip (not permanent) |
-| **The agent is not given the current time** (no time-passing hook, etc.) | The gate's OK/DEFER itself is normal (the gate uses the shell's `date`). But **the scheduling decisions and user notifications in FR-07/08 become unreliable** | Pass the current time each turn with `UserPromptSubmit`, etc. (§8) |
+| **The agent is not given the current time** (no time-passing hook, etc.) | The gate's OK/DEFER itself is normal (the gate uses the shell's `date`), but **the DEFER/resume scheduling in FR-07/08 cannot be done reliably**: the agent has no `now` to compute the wait, and may fabricate it | **Required for FR-07/08.** Pass the current time each turn with `UserPromptSubmit`, etc. (§8) |
 
 - Every fallback is on the **safe side (does not block)**, so "it will not break", but "thinking you are protected when you are not" is dangerous. As in NFR-07, always make `UNKNOWN` visible through `REASON`.
-- **Knowing the time is a prerequisite of the agent's behavior (FR-06/07/08), not of the gate decision.** The decision itself holds with the shell's `date`, but the timing of the deferral and the notification need awareness of the time.
+- **Knowing the time is a prerequisite of the agent's behavior (FR-06/07/08), not of the gate decision.** The decision itself holds with the shell's `date`, but scheduling the deferral needs the agent to know `now` (otherwise it may fabricate it and schedule the resume wrong).
 - `rate_limits` appears on standard input **only after the first API response of a Claude.ai Pro/Max subscriber**, and `five_hour` / `seven_day` can each be missing (§8, per the official schema).
 
 ---
@@ -185,7 +185,7 @@ In scope-(i), run the gate **right before launching a long-running workflow that
 - The scheduled launch time is `RESETS_AT` (plus a small margin).
 - If the reset is **within 1 hour**, use a short sleep mechanism (for example `ScheduleWakeup`, up to 3600 seconds). If it is **further out**, use a one-shot cron (for example `CronCreate`) or a chain of sleeps.
 - **Re-check at resume**: after the schedule fires, run the gate once more right before launch and confirm `OK` before launching (this prevents an immediate re-hit from drift in the reset estimate, which is thrash).
-- **Knowing the time is a prerequisite**: the branch of "within 1 hour or beyond" and the `RESETS_AT_HUMAN` user notification depend on **the agent knowing the current time**. A way to pass the current time each turn (for example, passing it through a `UserPromptSubmit` hook) is a condition for this to work (§2.4, §8).
+- **The agent must know the current time (required for this section)**: `RESETS_AT` is an absolute epoch, so to schedule the resume the agent has to compute the wait as `RESETS_AT - now`, and the "within 1 hour or beyond" branch also needs `now`. A default agent has no clock; without the current time it cannot schedule correctly and may fabricate `now`, producing a wrong resume time (too early causes an immediate re-DEFER, that is thrash; too late wastes the window). Passing the current time each turn (for example, through a `UserPromptSubmit` hook) is a condition for FR-07/08 to work (§2.4, §8). (The gate already prints `RESETS_AT_HUMAN`, so stating the absolute reset time does not need the agent's clock; computing the wait does.)
 
 ### FR-08 mid-run watchdog (finishing a single workflow that exceeds one window)
 
