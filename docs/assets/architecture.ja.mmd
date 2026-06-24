@@ -1,0 +1,8 @@
+flowchart TD
+  CC["Claude Code / statusline stdin<br/>（rate_limits を含む JSON）"] --> TEE["statusline-tee.sh<br/>（atomic write）"]
+  TEE --> ST[(rate_limit_state.json)]
+  ST --> G["rate-guard.sh — 純シェル・LLM不使用"]
+  G --> V{VERDICT}
+  V -->|OK / exit 0| GO[起動]
+  V -->|DEFER / exit 10| W[RESETS_AT まで先送り]
+  V -->|UNKNOWN / exit 20| FO[fail-open: 起動して明示]
