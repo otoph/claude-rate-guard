@@ -20,17 +20,7 @@
 
 ## 仕組み
 
-<!-- Mermaid 非対応環境（GitHub モバイルアプリ等）でも描画されるよう SVG にしています。
-     編集しやすいよう図のソースを残します:
-flowchart TD
-  CC["Claude Code / statusline stdin<br/>（rate_limits を含む JSON）"] --> TEE["statusline-tee.sh<br/>（atomic write）"]
-  TEE --> ST[(rate_limit_state.json)]
-  ST --> G["rate-guard.sh — 純シェル・LLM不使用"]
-  G --> V{VERDICT}
-  V -->|OK / exit 0| GO[起動]
-  V -->|DEFER / exit 10| W[RESETS_AT まで先送り]
-  V -->|UNKNOWN / exit 20| FO[fail-open: 起動して明示]
--->
+<!-- Mermaid 非対応環境（GitHub モバイルアプリ等）でも描画されるよう SVG にしています。図のソース: docs/assets/architecture.ja.mmd -->
 ![claude-rate-guard のデータフロー: Claude Code statusline stdin → statusline-tee.sh → rate_limit_state.json → rate-guard.sh → VERDICT（OK は起動、DEFER は RESETS_AT まで先送り、UNKNOWN は fail-open で起動）](docs/assets/architecture.ja.svg)
 
 1. **`statusline-tee.sh`** を、いま使っている `statusLine.command` に追記します。ステータス行が描画されるたびに、入力から利用率とリセット時刻（epoch）を読み取り、小さな state ファイルにまとめて書き込みます（書き込みは一括で行い、途中の状態を読まれないようにします）。
