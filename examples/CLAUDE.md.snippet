@@ -13,18 +13,36 @@ calls are exempt).
 
 - **Pre-flight (before launching a long workflow):** run
   `bash ~/.claude/scripts/rate-guard.sh`.
-  - `OK`: launch.
+  - `OK`: check the budget too — launch only if
+    **estimated consumption × 1.3 ≤ `HEADROOM_PCT`**; otherwise split into
+    batches (below). Measure the unit cost with a small first batch instead of
+    guessing it.
   - `DEFER`: do **not** launch. Schedule a retry just after `RESETS_AT`
-    (`SECONDS_TO_RESET` gives the delay directly; within an hour, a short wakeup;
-    further out, a one-shot cron), tell the user it is deferred, and re-run the
-    guard when it fires; launch only on `OK`.
+    (`SECONDS_TO_RESET + 120` gives the delay directly; within an hour, a short
+    wakeup; further out, a one-shot cron), tell the user it is deferred, and
+    re-run the guard when it fires; launch only on `OK`.
   - `UNKNOWN`: fail-open. Launch, but state that the remaining budget is unknown.
 
-- **Mid-run watchdog (a single run that may exceed one window):** launch it in the
-  background and keep its run id. At a coarse interval, run the guard. On `DEFER`,
-  stop at a checkpoint (keep the journal) and schedule a resume after the reset.
-  When it fires and the guard says `OK`, resume from the checkpoint. Repeat for
-  each window the run spans.
+- **Batch splitting (large work over many units — the first line of defense):**
+  size batches so they fit the headroom, re-run the guard before each batch,
+  and commit results per batch (idempotent checkpoints). Crossing a window then
+  stops at a boundary, losing nothing. A threshold alone cannot protect a
+  highly parallel fleet.
+
+- **Mid-run watchdog (a single run that may exceed one window — insurance):**
+  launch it in the background and keep its run id. Run the guard at an interval
+  below `(100 − threshold) ÷ max burn rate (pt/min)` — not a fixed "20 minutes".
+  On `DEFER` (or when the burn rate says the next tick would be too late), stop
+  at a checkpoint (keep the journal) and schedule a resume after the reset. When
+  it fires and the guard says `OK`, resume from the checkpoint. Repeat for each
+  window the run spans.
+
+- **Crash resilience:** persist resume information (script path, run id, batch
+  progress, journal location) to `~/.claude/rate-guard/resume.json` at launch and
+  each batch boundary; check it for unfinished entries at session start.
+  `resumeFromRunId` is same-session only — after a crash, reconstruct a
+  continuation script from the journal instead. Keep scripts and intermediate
+  artifacts out of `/tmp`.
 
 Why stop at the threshold instead of running to 100%: at 100% the orchestrator's
 subagent calls fail and are often swallowed, so the run silently returns degraded

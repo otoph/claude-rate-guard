@@ -26,7 +26,37 @@ rate-guard.sh >/dev/null; case $? in
 esac
 ```
 
-## 2. Scheduling a resume after `DEFER`
+## 2. Budget sizing with `HEADROOM_PCT` (large fleets)
+
+An `OK` verdict alone cannot protect a highly parallel run: a fleet burning
+several points per minute can eat the whole window minutes after a green light.
+Before a large launch, compare the **estimated consumption** against the
+headroom the gate reports:
+
+```sh
+# Launch only if the estimated cost (in points of the 5h window) fits.
+est_points=13            # measured, not guessed - see below
+headroom="$(rate-guard.sh | awk -F= '/^HEADROOM_PCT=/{print $2}')"
+if [ -n "$headroom" ] && awk -v e="$est_points" -v h="$headroom" 'BEGIN{exit !(e*1.3 <= h)}'; then
+  ./run-long-job.sh
+else
+  echo "does not fit (need $est_points x1.3, have ${headroom:-unknown}); split into batches"
+fi
+```
+
+Measure the unit cost instead of assuming it — it varies severalfold with the
+model configuration:
+
+1. Read `FIVE_HOUR_PCT`, run a **small measurement batch** (a few units), read
+   `FIVE_HOUR_PCT` again. Points-per-unit = delta ÷ units.
+   (The state updates only when the status line runs, so read it from a fresh
+   gate call after the batch's results are in.)
+2. Size every following batch so `batch_units × points_per_unit × 1.3 ≤ HEADROOM_PCT`.
+3. Re-run the gate **before each batch**, commit results per batch, and on
+   `DEFER` schedule the next batch after the reset (section 3). Crossing a
+   window then loses nothing: the run stops at a boundary, not mid-flight.
+
+## 3. Scheduling a resume after `DEFER`
 
 `SECONDS_TO_RESET` is the wait the gate already computed, so you do not need the
 local clock. To resume right after the window resets:
@@ -40,19 +70,84 @@ rate-guard.sh >/dev/null && ./run-long-job.sh   # re-check, then launch
 In an agent loop, prefer the agent's own scheduler (a wakeup within the hour, a
 one-shot cron beyond it) over a blocking `sleep`, so the session stays responsive.
 
-## 3. Mid-run watchdog (multi-window runs)
+## 4. Mid-run watchdog (multi-window runs)
 
 For a job that can exceed one 5-hour window:
 
 1. Start the job in the background; keep a handle or checkpoint mechanism.
-2. At a coarse interval, run `rate-guard.sh`.
-3. On `DEFER`, stop the job at its next checkpoint (so no work is lost), then
+2. At a fixed interval, run `rate-guard.sh`. **Derive the interval from a
+   formula, not a fixed "N minutes"**:
+
+   > interval < (100 − threshold) ÷ maximum burn rate (points/minute)
+
+   Example: threshold 80 and a 16-parallel fleet burning 7 points/minute cap
+   the interval at ~2.8 minutes; a 20-minute interval can lose everything
+   before its first tick. The state is also only as fresh as the last
+   status-line run, so the effective lag is interval + staleness.
+3. **Predictive stop (recommended)**: keep the previous `FIVE_HOUR_PCT`, derive
+   the burn rate from the last two readings, and if the threshold will be
+   reached before the next tick, stop now even below the threshold.
+4. On `DEFER`, stop the job at its next checkpoint (so no work is lost), then
    schedule a resume just after `RESETS_AT`.
-4. When the resume fires, run the guard again; on `OK`, continue from the
+5. When the resume fires, run the guard again; on `OK`, continue from the
    checkpoint.
 
 Make the job's steps idempotent (or read-only) so an approximate stop point is
-safe to resume from.
+safe to resume from. Treat the watchdog as **insurance**: the first line of
+defense is budget sizing and batching (section 2), which stops at boundaries
+instead of mid-flight.
+
+## 5. Fail-fast inside a Workflow script
+
+When the window does run out mid-flight, orchestrators that map agent errors to
+`null` keep launching doomed agents (a field test wasted 113 launches this
+way). Guard the launches; abort after **consecutive** failures — a single
+`null` can also be an unrelated agent death or a user skip, so do not abort on
+the first:
+
+```js
+let consecutiveNulls = 0
+let aborted = false
+const guarded = async (fn) => {
+  if (aborted) return null
+  const r = await fn()
+  if (r === null) {
+    consecutiveNulls += 1
+    if (consecutiveNulls >= 3) {
+      aborted = true
+      log('3 consecutive agent failures - stopping new launches (likely window exhaustion)')
+    }
+  } else {
+    consecutiveNulls = 0
+  }
+  return r
+}
+
+// usage: wrap every launch
+const results = await parallel(items.map(x => () => guarded(() => agent(promptFor(x)))))
+```
+
+Notes: agents already in flight cannot be stopped this way — only queued
+launches short-circuit. Report the aborted count in the workflow's return value
+so a partial result is never mistaken for a complete one.
+
+## 6. Recovering after a crash
+
+Session-scoped resume handles (`resumeFromRunId`, scheduled wakeups,
+session-scoped cron) die with the session. To survive a crash:
+
+- At launch and at each batch boundary, persist what recovery needs to a
+  **persistent file** (for example `~/.claude/rate-guard/resume.json`):
+  the script path, run id, batch progress, scheduled resume time, and where the
+  journal/transcript lives.
+- After a crash, a transparent resume is not possible (`resumeFromRunId` is
+  same-session only). Instead, use that file to find the journal, read what
+  completed, and write a continuation script for the remaining work.
+- Keep workflow scripts and intermediate artifacts out of `/tmp` — it does not
+  survive a crash or reboot.
+- An OS cron / systemd timer can trigger recovery, but it starts headless,
+  where the status line does not run (gate `UNKNOWN`). Do the recovery itself
+  in an interactive session.
 
 ## Tuning
 
