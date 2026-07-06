@@ -113,16 +113,22 @@ sends nothing over the network, so there is nothing else to clean up.
 | `DEFER`   | `10` | usage is at or above the threshold; do **not** start, wait for the reset |
 | `UNKNOWN` | `20` | state is missing, stale, or incomplete; **fail-open**: proceed, but flag that the remaining budget is unknown |
 
-Keys printed: `VERDICT`, `FIVE_HOUR_PCT`, `RESETS_AT` (epoch), `RESETS_AT_HUMAN`,
-`SECONDS_TO_RESET`, `REASON`. `SECONDS_TO_RESET` is the wait until the reset,
-computed by the gate (`RESETS_AT - now`), so an agent can schedule a resume from
-it without knowing the current time (empty if the reset time is unknown, negative
-if it has already passed).
+Keys printed: `VERDICT`, `FIVE_HOUR_PCT`, `HEADROOM_PCT`, `RESETS_AT` (epoch),
+`RESETS_AT_HUMAN`, `SECONDS_TO_RESET`, `REASON`. `SECONDS_TO_RESET` is the wait
+until the reset, computed by the gate (`RESETS_AT - now`), so an agent can
+schedule a resume from it without knowing the current time (empty if the reset
+time is unknown, negative if it has already passed). `HEADROOM_PCT` is the room
+left up to the threshold (`threshold - usage`, floored at 0; empty on
+`UNKNOWN`) — compare your estimated consumption against it before a large
+launch. Numbers are printed with float artifacts stripped (`%g`, e.g.
+`14.000000000000002` → `14`) while keeping effective precision, so deltas stay
+measurable; the verdict is computed on the raw value.
 
 ```sh
 $ rate-guard.sh
 VERDICT=OK
 FIVE_HOUR_PCT=37
+HEADROOM_PCT=43
 RESETS_AT=1782200400
 RESETS_AT_HUMAN=06/23 16:40
 SECONDS_TO_RESET=4853
@@ -143,14 +149,21 @@ REASON=5h usage 37% < threshold 80%
 
 ## Using it with an agent
 
-Two patterns (see [`examples/`](./examples)):
+Three patterns (see [`examples/`](./examples)):
 
-- **Pre-flight**: before starting a long workflow, run the guard. `OK` starts the
-  run; `DEFER` skips it and schedules a retry just after `RESETS_AT`; `UNKNOWN`
+- **Pre-flight with budget sizing**: before starting a long workflow, run the
+  guard. `OK` alone is not enough for a large launch — also check that the
+  estimated consumption (× 1.3 safety factor) fits `HEADROOM_PCT`. `DEFER`
+  skips the run and schedules a retry just after `RESETS_AT`; `UNKNOWN`
   proceeds but states that the remaining budget is unknown.
-- **Mid-run watchdog**: for a run that may exceed one window, start it in the
-  background, then run the guard at a coarse interval. On `DEFER`, stop at a
-  checkpoint and schedule a resume after the reset.
+- **Batch splitting** (the first line of defense for large fleets): measure the
+  cost per unit with a small first batch, size batches to fit the headroom,
+  re-run the guard at each batch boundary, and commit results per batch. The
+  run then stops at boundaries, never mid-flight.
+- **Mid-run watchdog** (insurance): for a single run that may exceed one
+  window, start it in the background, then run the guard at an interval below
+  `(100 − threshold) ÷ max burn rate`. On `DEFER`, stop at a checkpoint and
+  schedule a resume after the reset.
 
 [`examples/CLAUDE.md.snippet`](./examples/CLAUDE.md.snippet) is an operating
 contract you can paste into your project's `CLAUDE.md`.
@@ -169,6 +182,10 @@ contract you can paste into your project's `CLAUDE.md`.
 - The verdict reflects the moment it was read. Treat `DEFER` as "stop soon", not
   an exact stop point. Read-only workflows are safe to stop; side-effecting ones
   should be idempotent.
+- **A threshold alone cannot protect a highly parallel fleet.** A run burning
+  several points per minute can exhaust the window minutes after an `OK`.
+  Compare the estimated consumption against `HEADROOM_PCT` and split large work
+  into batches (see the spec, FR-06/FR-09).
 
 ---
 
