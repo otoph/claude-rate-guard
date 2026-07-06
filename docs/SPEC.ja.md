@@ -146,19 +146,20 @@
   - 材料が欠ける or 古い → `VERDICT=UNKNOWN`、exit **20**
 - **出力は機械が読める `KEY=VALUE` 行**（標準出力）：`VERDICT` / `FIVE_HOUR_PCT` / `HEADROOM_PCT` / `RESETS_AT` / `RESETS_AT_HUMAN` / `SECONDS_TO_RESET` / `REASON`。`SECONDS_TO_RESET` は実行時にゲートが算出する `RESETS_AT − now`（リセット時刻が不明なら空、すでに過ぎていれば負値）。エージェントは自分の時計が無くても、この値で再開を予約できる。
 - **`HEADROOM_PCT` ＝ 閾値までの余裕**（`しきい値 − used_percentage`、負なら `0`）。予算比較（FR-06）の右辺に使う。`OK`/`DEFER` のときだけ値を持ち、`UNKNOWN` では空。基準は 100% でなく **しきい値** であることに注意（しきい値までの余白は対話ターン用の予約として残す設計・FR-06）。
-- **表示の丸め**：`FIVE_HOUR_PCT` / `HEADROOM_PCT` は小数1桁に丸めて出力する（サーバ値の過剰精度、例 `14.000000000000002` を吸収）。**判定は丸める前の生値で行う**。境界で表示と判定が食い違って見える場合（例：生値 79.96 → 表示 `80` だが `VERDICT=OK`）は `VERDICT` が正。
+- **表示の整形**：`FIVE_HOUR_PCT` / `HEADROOM_PCT` は `%g`（6有効桁）で整形し、サーバ値の浮動小数アーティファクト（例 `14.000000000000002` → `14`）だけを除去する。実質の精度は保たれるため、**前後差分による計測（FR-06 の計測バッチ）を壊さない**。判定は整形前の生値で行い、表示と食い違う極端な境界では `VERDICT` が正。数値出力はロケールに依存しない（`LC_ALL=C`・小数点は常にピリオド）。
 - 小数の比較は `awk` などで行う（bash の整数比較に丸めない）。
 - **LLM を一切使わない**（判定と計算はコードで行う）。
 - **しきい値の妥当性チェック**：`RATE_GUARD_THRESHOLD` が妥当な範囲 `[10,95]` を外れたら **標準エラーに警告** する（設定ミスの検知）。判定は続け、**標準出力の KEY=VALUE は汚さない**。上げすぎ＝無防備、下げすぎ＝恒久 DEFER で詰む、の両方に早く気づけるようにする。
 
 ### FR-04 新しさ・欠落＝安全側（原因を区別して見せる）
 
-- state ファイルが **無い / `written_at` が欠ける・数値でない / `five_hour.used_percentage` が `null` / `written_at` が現在から `STALE_SECONDS`（既定 900 秒）より古い** のいずれかなら `UNKNOWN`（exit 20）を返す。
+- state ファイルが **無い / `written_at` が欠ける・数値でない / `five_hour.used_percentage` が `null` または数値でない / `written_at` が現在から `STALE_SECONDS`（既定 900 秒）より古い** のいずれかなら `UNKNOWN`（exit 20）を返す。
 - UNKNOWN は **止めない**（fail-open）。理由は、初回の未生成・放置後に古くなった・非 Pro/Max・headless での未発火などで、すべてのワークフローを誤って止めるのを避けるため。枠切れ自体はハーネスの rate-limit エラーが最後の歯止めになる。
 - **黙らせず、原因を `REASON` で区別する**（同じ UNKNOWN でも対処が違うため）：
   - state ファイル無し → 「`statusLine.command` 未設定 or tee 未実行」
   - `written_at` が欠ける・数値でない → 「state の破損／tee の故障の疑い（`rate-guard.tee.log` を参照）」。計算の前に整数かを確認し、数値でなくてもクラッシュせず UNKNOWN を返す
   - `used_percentage` が `null` → 「**rate_limits が無い＝非 Pro/Max または初回応答前**。ここではゲートは効かない」（構造的・恒久の可能性）
+  - `used_percentage` が数値でない → 「state の破損／tee の故障の疑い」。**0 と誤読して `OK`（満額の `HEADROOM_PCT`）を返してはならない**
   - 古い → 「古い。**対話中なら tee の故障の疑い**（`rate-guard.tee.log` を参照）」（一時 or 故障）
 
 ### FR-05 設定パラメータ（環境変数で上書き可）
@@ -191,6 +192,8 @@ scope-(i) で **1本まるごと回る長時間ワークフローを起動する
 
 - **推定単価は実測で適応させる**：静的な仮定ではなく、最初に小さな計測バッチを流し、前後の `FIVE_HOUR_PCT` の差から pt/ユニットを求め、以降のバッチサイズを決める。単価はモデル構成で数倍変わる（実測で約 2.7 倍差）。
 - **`FIVE_HOUR_PCT` の鮮度に注意**：state の更新は statusline の実行（新しいアシスタントメッセージ等・§8）に依存する。バックグラウンド走行中は監視の起床がその契機になるため、計測値は「最後に statusline が動いた時点」の値である。
+- **計測差分が 0 のときは単価 0 としない**：直前の項の遅れにより、計測バッチ直後の読み取りには消費が未反映のことがある。差分 0 は「タダ」ではなく「未計測」。state の更新後に読み直すか、計測バッチを大きくする。**単価 0 のままサイズ計算に進んではならない**（`0 × 何でも ≦ 余裕` が常に成立し、バッチが無制限になる）。
+- **最小バッチすら収まらないときは DEFER 扱い**：`VERDICT=OK` でも `HEADROOM_PCT` が最小のバッチに満たない場合（しきい値の直下では 0 に近づく）は、DEFER と同じ手順（FR-07）で `RESETS_AT` 直後へ次の起動を予約する。OK のまま黙って保留し続けない（黙った先送りは NFR-07 違反）。
 - **余白は意図的に二重**：安全係数 1.3（見積もり誤差の吸収）に加えて、しきい値（既定 80）が 100% までの 20pt を対話ターン用に予約する。重ね掛けは意図的であり、どちらか一方を外さない。
 
 ### FR-07 DEFER のときの予約
@@ -309,8 +312,10 @@ FR-07/08 の予約（wakeup・セッション限定 cron）と `TaskStop`/`resum
 | 17 | `used_percentage=42`, しきい値 80 | `HEADROOM_PCT=38`（= 80 − 42） |
 | 18 | `used_percentage=85`, しきい値 80（DEFER） | `HEADROOM_PCT=0`（負は 0） |
 | 19 | UNKNOWN の各系（state 無し／古い／null） | `HEADROOM_PCT=`（空） |
-| 20 | `used_percentage=14.000000000000002` | `FIVE_HOUR_PCT=14`（小数1桁へ丸め・判定は生値のまま） |
-| 21 | `used_percentage=79.96`, しきい値 80 | `VERDICT=OK`（生値で比較）・表示は `FIVE_HOUR_PCT=80`（境界では `VERDICT` が正・FR-03） |
+| 20 | `used_percentage=14.000000000000002` | `FIVE_HOUR_PCT=14`（アーティファクト除去・判定は生値のまま） |
+| 21 | `used_percentage=79.96`, しきい値 80 | `VERDICT=OK`・`FIVE_HOUR_PCT=79.96`・`HEADROOM_PCT=0.04`（`%g` 整形は実質の精度を保ち、差分計測を壊さない） |
+| 22 | `used_percentage` が数値でない（`"abc"` 等） | `UNKNOWN` / exit 20（0 に強制変換して `OK`・満額 `HEADROOM_PCT` を返さない） |
+| 23 | 小数点がカンマのロケール（例 `LC_ALL=de_DE.UTF-8`）で実行 | 数値出力の小数点はピリオドのまま（`LC_ALL=C` 固定・FR-03） |
 
 ---
 
@@ -420,6 +425,7 @@ exit 0   # tee 失敗・見えるバーの短絡で非ゼロ終了 → statuslin
 # 5時間セッション枠に「1本回す余力」があるかを判定する純コード（LLM不使用）。
 # 出力: KEY=VALUE 行 / 終了コード 0=OK 10=DEFER 20=UNKNOWN(fail-open)
 set -u
+export LC_ALL=C   # awk の数値出力・解釈をロケール非依存に（小数点は常にピリオド）
 THRESHOLD="${RATE_GUARD_THRESHOLD:-80}"
 STALE_SECONDS="${RATE_GUARD_STALE_SECONDS:-900}"
 STATE_FILE="${RATE_GUARD_STATE_FILE:-$HOME/.claude/rate_limit_state.json}"
@@ -443,11 +449,13 @@ secs_to_reset() {
     *) echo "$(( $1 - now ))" ;;
   esac
 }
-# 表示用の丸め（小数1桁・末尾ゼロ省略）。判定は生値で行い、境界で表示と食い違うときは VERDICT が正。
-round1() {
+# 数値の整形（%g・6有効桁）：サーバ値の浮動小数アーティファクト（例 14.000000000000002 → 14）だけを
+# 除去し、実質の精度は保つ（前後差分による計測バッチを壊さない）。判定は生値で行い、
+# 表示と食い違う極端な境界では VERDICT が正。
+fmt_num() {
   case "$1" in
     ''|*[!0-9.]*|*.*.*|.) printf '%s\n' "$1" ;;
-    *) awk -v x="$1" 'BEGIN{printf "%g\n", int(x*10+0.5)/10}' ;;
+    *) awk -v x="$1" 'BEGIN{printf "%g\n", x}' ;;
   esac
 }
 
@@ -462,7 +470,7 @@ pct=$(jq -r '.five_hour.used_percentage // empty' "$STATE_FILE" 2>/dev/null)
 reset=$(jq -r '.five_hour.resets_at // empty' "$STATE_FILE" 2>/dev/null)
 reset_h=$(fmt_reset "$reset")
 secs=$(secs_to_reset "$reset")
-pct_disp=$(round1 "$pct")
+pct_disp=$(fmt_num "$pct")
 
 case "$written" in
   ''|*[!0-9]*)
@@ -475,6 +483,13 @@ if [ -z "$pct" ]; then
        "REASON=rate_limits absent (five_hour.used_percentage null); non Pro/Max or before first API response -- gate inoperative here"
   exit 20
 fi
+# 非数値の used_percentage は 0 と誤読して OK を返さず、破損として UNKNOWN に倒す
+case "$pct" in
+  *[!0-9.]*|*.*.*|.)
+    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
+         "REASON=state malformed (used_percentage non-numeric); statusline tee may be broken (see ~/.claude/rate-guard.tee.log)"
+    exit 20 ;;
+esac
 
 age=$(( now - written ))
 if [ "$age" -gt "$STALE_SECONDS" ]; then
@@ -484,7 +499,7 @@ if [ "$age" -gt "$STALE_SECONDS" ]; then
 fi
 
 # 閾値までの余裕（= しきい値 − 使用率、負なら 0）。予算比較（推定消費×1.3 ≦ HEADROOM_PCT）の右辺に使う。
-headroom=$(awk -v p="$pct" -v t="$THRESHOLD" 'BEGIN{h=t-p; if(h<0)h=0; printf "%g\n", int(h*10+0.5)/10}')
+headroom=$(awk -v p="$pct" -v t="$THRESHOLD" 'BEGIN{h=t-p; if(h<0)h=0; printf "%g\n", h}')
 
 over=$(awk -v p="$pct" -v t="$THRESHOLD" 'BEGIN{print (p+0 >= t+0) ? 1 : 0}')
 if [ "$over" = "1" ]; then

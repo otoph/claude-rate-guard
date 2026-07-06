@@ -16,7 +16,9 @@ calls are exempt).
   - `OK`: check the budget too — launch only if
     **estimated consumption × 1.3 ≤ `HEADROOM_PCT`**; otherwise split into
     batches (below). Measure the unit cost with a small first batch instead of
-    guessing it.
+    guessing it (a zero delta means "not yet measured", never "free"). If even
+    the smallest batch does not fit, treat it as `DEFER`: schedule just after
+    `RESETS_AT` instead of silently holding.
   - `DEFER`: do **not** launch. Schedule a retry just after `RESETS_AT`
     (`SECONDS_TO_RESET + 120` gives the delay directly; within an hour, a short
     wakeup; further out, a one-shot cron), tell the user it is deferred, and

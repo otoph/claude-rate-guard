@@ -76,7 +76,7 @@
 | `DEFER`   | `10` | 利用率がしきい値以上。起動**しない**でリセットを待つ |
 | `UNKNOWN` | `20` | state が無い・古い・不完全。**fail-open**（起動するが、残量が不明であることを伝える） |
 
-出力するキー：`VERDICT` / `FIVE_HOUR_PCT` / `HEADROOM_PCT` / `RESETS_AT`（epoch）/ `RESETS_AT_HUMAN` / `SECONDS_TO_RESET` / `REASON`。`SECONDS_TO_RESET` はリセットまでの残り秒で、ゲートが `RESETS_AT − now` で算出します。エージェントは自分の現在時刻を知らなくても、この値で再開を予約できます（リセット時刻が不明なら空、すでに過ぎていれば負値）。`HEADROOM_PCT` はしきい値までの余裕（`しきい値 − 使用率`、負なら 0。`UNKNOWN` では空）で、大きな起動の前に推定消費と突き合わせます。百分率は表示用に小数1桁へ丸めますが、判定は丸める前の生値で行います。
+出力するキー：`VERDICT` / `FIVE_HOUR_PCT` / `HEADROOM_PCT` / `RESETS_AT`（epoch）/ `RESETS_AT_HUMAN` / `SECONDS_TO_RESET` / `REASON`。`SECONDS_TO_RESET` はリセットまでの残り秒で、ゲートが `RESETS_AT − now` で算出します。エージェントは自分の現在時刻を知らなくても、この値で再開を予約できます（リセット時刻が不明なら空、すでに過ぎていれば負値）。`HEADROOM_PCT` はしきい値までの余裕（`しきい値 − 使用率`、負なら 0。`UNKNOWN` では空）で、大きな起動の前に推定消費と突き合わせます。数値は浮動小数の誤差（`14.000000000000002` 等）だけを除いた形で出力し、実質の精度は保ちます（前後差分の計測が可能）。判定は生値で行います。
 
 ```sh
 $ rate-guard.sh

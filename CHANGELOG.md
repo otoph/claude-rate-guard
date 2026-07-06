@@ -33,14 +33,28 @@ of defense.
   `examples/workflow-integration.md`.
 
 ### Changed
-- `FIVE_HOUR_PCT` (and `HEADROOM_PCT`) are rounded to one decimal place for
-  display, absorbing excess server-value precision (e.g.
-  `14.000000000000002`). The verdict is still computed on the raw value;
-  `VERDICT` is authoritative at the boundary.
+- `FIVE_HOUR_PCT` (and `HEADROOM_PCT`) are printed through `%g`, stripping only
+  the float artifacts of the server value (e.g. `14.000000000000002` → `14`)
+  while keeping effective precision, so delta-based unit-cost measurement
+  still works. The verdict is computed on the raw value; `VERDICT` is
+  authoritative at the boundary.
 - The mid-run watchdog (FR-08) is repositioned as insurance; batch splitting
   (FR-09) is the first line of defense.
 - The default resume cushion after `DEFER` is documented as 120 seconds
   (`SECONDS_TO_RESET + 120`, FR-07).
+
+### Fixed
+- A non-numeric `used_percentage` (corrupted state) now returns `UNKNOWN`
+  instead of being coerced to 0 and green-lighting with the full headroom
+  (latent since 0.1.0 for the verdict; the new `HEADROOM_PCT` raised the
+  stakes).
+- Numeric output is locale-independent (`LC_ALL=C`), so the decimal separator
+  stays a period under comma-decimal locales.
+- The budget-sizing example keeps `UNKNOWN` fail-open (it no longer locks out
+  environments where the gate cannot see `rate_limits`), and the docs define
+  what to do when even the smallest batch does not fit at `OK` (treat it as
+  `DEFER` and schedule after the reset) and when a measured delta reads 0
+  (re-measure; never size batches with a unit cost of 0).
 
 ## [0.1.0] - 2026-06-23
 

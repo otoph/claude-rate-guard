@@ -120,8 +120,9 @@ schedule a resume from it without knowing the current time (empty if the reset
 time is unknown, negative if it has already passed). `HEADROOM_PCT` is the room
 left up to the threshold (`threshold - usage`, floored at 0; empty on
 `UNKNOWN`) — compare your estimated consumption against it before a large
-launch. Percentages are rounded to one decimal for display; the verdict is
-computed on the raw value.
+launch. Numbers are printed with float artifacts stripped (`%g`, e.g.
+`14.000000000000002` → `14`) while keeping effective precision, so deltas stay
+measurable; the verdict is computed on the raw value.
 
 ```sh
 $ rate-guard.sh

@@ -35,13 +35,23 @@ headroom the gate reports:
 
 ```sh
 # Launch only if the estimated cost (in points of the 5h window) fits.
+# Branch on VERDICT first: UNKNOWN stays fail-open (the budget check needs a
+# working gate; without one the contract says proceed and flag it).
 est_points=13            # measured, not guessed - see below
-headroom="$(rate-guard.sh | awk -F= '/^HEADROOM_PCT=/{print $2}')"
-if [ -n "$headroom" ] && awk -v e="$est_points" -v h="$headroom" 'BEGIN{exit !(e*1.3 <= h)}'; then
-  ./run-long-job.sh
-else
-  echo "does not fit (need $est_points x1.3, have ${headroom:-unknown}); split into batches"
-fi
+eval "$(rate-guard.sh | sed 's/^/RG_/')"
+case "$RG_VERDICT" in
+  UNKNOWN) echo "budget unknown, proceeding fail-open"; ./run-long-job.sh ;;
+  DEFER)   echo "deferring until $RG_RESETS_AT_HUMAN" ;;   # schedule per section 3
+  OK)
+    if awk -v e="$est_points" -v h="$RG_HEADROOM_PCT" 'BEGIN{exit !(e*1.3 <= h)}'; then
+      ./run-long-job.sh
+    else
+      echo "does not fit (need $est_points x1.3, have $RG_HEADROOM_PCT): split into batches"
+      # If even the smallest batch does not fit (headroom ~0 just under the
+      # threshold), treat it like DEFER: schedule just after RESETS_AT
+      # (section 3). Do not silently keep holding at OK.
+    fi ;;
+esac
 ```
 
 Measure the unit cost instead of assuming it — it varies severalfold with the
@@ -51,8 +61,13 @@ model configuration:
    `FIVE_HOUR_PCT` again. Points-per-unit = delta ÷ units.
    (The state updates only when the status line runs, so read it from a fresh
    gate call after the batch's results are in.)
-2. Size every following batch so `batch_units × points_per_unit × 1.3 ≤ HEADROOM_PCT`.
-3. Re-run the gate **before each batch**, commit results per batch, and on
+2. **A zero delta means "not yet measured", never "free"** — the state may
+   simply not have refreshed since the batch. Re-read after the next
+   status-line update or use a larger measurement batch; never size batches
+   with a unit cost of 0 (`0 × anything ≤ headroom` always passes and the
+   batch becomes unbounded).
+3. Size every following batch so `batch_units × points_per_unit × 1.3 ≤ HEADROOM_PCT`.
+4. Re-run the gate **before each batch**, commit results per batch, and on
    `DEFER` schedule the next batch after the reset (section 3). Crossing a
    window then loses nothing: the run stops at a boundary, not mid-flight.
 

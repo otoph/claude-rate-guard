@@ -148,19 +148,20 @@ Default path: `~/.claude/rate_limit_state.json`.
   - material missing or stale → `VERDICT=UNKNOWN`, exit **20**
 - **The output is machine-readable `KEY=VALUE` lines** (standard output): `VERDICT` / `FIVE_HOUR_PCT` / `HEADROOM_PCT` / `RESETS_AT` / `RESETS_AT_HUMAN` / `SECONDS_TO_RESET` / `REASON`. `SECONDS_TO_RESET` is `RESETS_AT - now` computed by the gate at run time (empty if the reset time is unknown, negative if it has already passed); an agent can schedule a resume from it without its own clock.
 - **`HEADROOM_PCT` = the headroom up to the threshold** (`threshold - used_percentage`, floored at `0`). It is the right-hand side of the budget comparison (FR-06). It carries a value only on `OK`/`DEFER` and is empty on `UNKNOWN`. Note the base is the **threshold**, not 100% (the margin between the threshold and 100% is deliberately reserved for interactive turns, FR-06).
-- **Display rounding**: `FIVE_HOUR_PCT` / `HEADROOM_PCT` are printed rounded to one decimal place (absorbing excess server-value precision such as `14.000000000000002`). **The verdict is computed on the raw, unrounded value.** When the display and the verdict look inconsistent at the boundary (for example, raw 79.96 → displayed `80` but `VERDICT=OK`), `VERDICT` is authoritative.
+- **Display formatting**: `FIVE_HOUR_PCT` / `HEADROOM_PCT` are printed through `%g` (6 significant digits), which strips only the float artifacts of the server value (for example `14.000000000000002` → `14`). Effective precision is kept, so **delta-based measurement (the FR-06 measurement batch) is not broken**. The verdict is computed on the raw value; in an extreme boundary case where the display disagrees, `VERDICT` is authoritative. Numeric output is locale-independent (`LC_ALL=C`; the decimal separator is always a period).
 - Compare decimals with `awk`, etc. (do not round to a bash integer comparison).
 - **Use no LLM at all** (decision and calculation are done in code).
 - **Threshold validity check**: if `RATE_GUARD_THRESHOLD` is outside the valid range `[10,95]`, **warn to standard error** (to catch a misconfiguration). Continue the decision and **do not pollute the standard-output KEY=VALUE**. This makes both "set too high (defenseless)" and "set too low (stuck in permanent DEFER)" noticeable early.
 
 ### FR-04 Freshness and absence = safe side (show the cause, distinguished)
 
-- Return `UNKNOWN` (exit 20) if any of these hold: the state file **does not exist / `written_at` is missing or not a number / `five_hour.used_percentage` is `null` / `written_at` is older than `STALE_SECONDS` (default 900 seconds) from now**.
+- Return `UNKNOWN` (exit 20) if any of these hold: the state file **does not exist / `written_at` is missing or not a number / `five_hour.used_percentage` is `null` or not a number / `written_at` is older than `STALE_SECONDS` (default 900 seconds) from now**.
 - UNKNOWN **does not block** (fail-open). The reason is to avoid wrongly stopping every workflow because of a first-run not-yet-created file, going stale after idle time, non Pro/Max, or not firing under headless. The window running out itself is backstopped by the harness's rate-limit error.
 - **Do not stay silent; distinguish the cause through `REASON`** (the same UNKNOWN calls for different handling):
   - no state file → "`statusLine.command` not set or tee not run yet"
   - `written_at` missing or not a number → "suspected state corruption / tee failure (see `rate-guard.tee.log`)". Check that it is an integer before calculating, and return UNKNOWN without crashing even when it is not a number
   - `used_percentage` is `null` → "**rate_limits absent = non Pro/Max or before the first response**. The gate does not work here" (possibly structural and permanent)
+  - `used_percentage` is not a number → "suspected state corruption / tee failure". **It must not be misread as 0 and return `OK` (with the full `HEADROOM_PCT`)**
   - stale → "stale. **If mid-session, suspect a tee failure** (see `rate-guard.tee.log`)" (temporary or a failure)
 
 ### FR-05 Configuration parameters (overridable with environment variables)
@@ -193,6 +194,8 @@ A plain comparison against the threshold sees only "what is left at launch time"
 
 - **Adapt the unit cost from measurement**: instead of a static assumption, first run a small measurement batch, derive points-per-unit from the change in `FIVE_HOUR_PCT`, and size the following batches from it. The unit cost varies severalfold with the model configuration (about 2.7x measured).
 - **Mind the freshness of `FIVE_HOUR_PCT`**: the state updates only when the status line runs (a new assistant message, etc., §8). While a run is in the background, the monitor's wake-ups are what trigger it, so a reading is "as of the last time the status line ran".
+- **A measured delta of 0 does not mean a unit cost of 0**: because of the lag above, a reading taken right after the measurement batch may not reflect its consumption yet. A zero delta means "not yet measured", not "free". Re-read after the state updates, or use a larger measurement batch. **Never proceed to batch sizing with a unit cost of 0** (`0 × anything ≤ headroom` always holds and the batch becomes unbounded).
+- **When even the smallest batch does not fit, treat it as DEFER**: even on `VERDICT=OK`, when `HEADROOM_PCT` is below the smallest batch (it approaches 0 just under the threshold), schedule the next launch just after `RESETS_AT` with the same procedure as DEFER (FR-07). Do not keep silently holding at OK (a silent postponement violates NFR-07).
 - **The margin is deliberately doubled**: the safety factor 1.3 (absorbing estimation error) on top of the threshold (default 80) reserving the 20 points up to 100% for interactive turns. The doubling is intentional; do not remove either one.
 
 ### FR-07 Scheduling on DEFER
@@ -311,8 +314,10 @@ The implementation must satisfy the following.
 | 17 | `used_percentage=42`, threshold 80 | `HEADROOM_PCT=38` (= 80 - 42) |
 | 18 | `used_percentage=85`, threshold 80 (DEFER) | `HEADROOM_PCT=0` (negative floors to 0) |
 | 19 | Each UNKNOWN case (no state / stale / null) | `HEADROOM_PCT=` (empty) |
-| 20 | `used_percentage=14.000000000000002` | `FIVE_HOUR_PCT=14` (rounded to one decimal for display; the verdict uses the raw value) |
-| 21 | `used_percentage=79.96`, threshold 80 | `VERDICT=OK` (raw-value comparison), displayed `FIVE_HOUR_PCT=80` (`VERDICT` is authoritative at the boundary, FR-03) |
+| 20 | `used_percentage=14.000000000000002` | `FIVE_HOUR_PCT=14` (artifact stripped; the verdict uses the raw value) |
+| 21 | `used_percentage=79.96`, threshold 80 | `VERDICT=OK`, `FIVE_HOUR_PCT=79.96`, `HEADROOM_PCT=0.04` (the `%g` formatting keeps effective precision and does not break delta measurement) |
+| 22 | `used_percentage` is not a number (`"abc"`, etc.) | `UNKNOWN` / exit 20 (must not be coerced to 0 and return `OK` with the full `HEADROOM_PCT`) |
+| 23 | Run under a comma-decimal locale (for example `LC_ALL=de_DE.UTF-8`) | The decimal separator in numeric output stays a period (`LC_ALL=C` pinned, FR-03) |
 
 ---
 
@@ -422,6 +427,7 @@ Wiring into `settings.json` (for an unset environment):
 # Code only (no LLM) that decides whether there is room to run one workflow in the 5-hour session window.
 # Output: KEY=VALUE lines / exit codes 0=OK 10=DEFER 20=UNKNOWN(fail-open)
 set -u
+export LC_ALL=C   # locale-independent numeric output/parsing in awk (the decimal separator is always a period)
 THRESHOLD="${RATE_GUARD_THRESHOLD:-80}"
 STALE_SECONDS="${RATE_GUARD_STALE_SECONDS:-900}"
 STATE_FILE="${RATE_GUARD_STATE_FILE:-$HOME/.claude/rate_limit_state.json}"
@@ -446,12 +452,14 @@ secs_to_reset() {
     *) echo "$(( $1 - now ))" ;;
   esac
 }
-# Display rounding (one decimal, trailing zeros stripped). The verdict uses the raw value;
-# when the display disagrees at the boundary, VERDICT is authoritative.
-round1() {
+# Numeric formatting (%g, 6 significant digits): strips only the float artifacts of the server
+# value (e.g. 14.000000000000002 -> 14) while keeping effective precision (delta-based
+# measurement batches still work). The verdict uses the raw value; in an extreme boundary
+# case where the display disagrees, VERDICT is authoritative.
+fmt_num() {
   case "$1" in
     ''|*[!0-9.]*|*.*.*|.) printf '%s\n' "$1" ;;
-    *) awk -v x="$1" 'BEGIN{printf "%g\n", int(x*10+0.5)/10}' ;;
+    *) awk -v x="$1" 'BEGIN{printf "%g\n", x}' ;;
   esac
 }
 
@@ -466,7 +474,7 @@ pct=$(jq -r '.five_hour.used_percentage // empty' "$STATE_FILE" 2>/dev/null)
 reset=$(jq -r '.five_hour.resets_at // empty' "$STATE_FILE" 2>/dev/null)
 reset_h=$(fmt_reset "$reset")
 secs=$(secs_to_reset "$reset")
-pct_disp=$(round1 "$pct")
+pct_disp=$(fmt_num "$pct")
 
 case "$written" in
   ''|*[!0-9]*)
@@ -479,6 +487,13 @@ if [ -z "$pct" ]; then
        "REASON=rate_limits absent (five_hour.used_percentage null); non Pro/Max or before first API response -- gate inoperative here"
   exit 20
 fi
+# A non-numeric used_percentage must not be misread as 0 and return OK; fall to UNKNOWN as corruption
+case "$pct" in
+  *[!0-9.]*|*.*.*|.)
+    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
+         "REASON=state malformed (used_percentage non-numeric); statusline tee may be broken (see ~/.claude/rate-guard.tee.log)"
+    exit 20 ;;
+esac
 
 age=$(( now - written ))
 if [ "$age" -gt "$STALE_SECONDS" ]; then
@@ -489,7 +504,7 @@ fi
 
 # Headroom up to the threshold (= threshold - usage, floored at 0). The right-hand side of the
 # budget comparison (estimated consumption x 1.3 <= HEADROOM_PCT).
-headroom=$(awk -v p="$pct" -v t="$THRESHOLD" 'BEGIN{h=t-p; if(h<0)h=0; printf "%g\n", int(h*10+0.5)/10}')
+headroom=$(awk -v p="$pct" -v t="$THRESHOLD" 'BEGIN{h=t-p; if(h<0)h=0; printf "%g\n", h}')
 
 over=$(awk -v p="$pct" -v t="$THRESHOLD" 'BEGIN{print (p+0 >= t+0) ? 1 : 0}')
 if [ "$over" = "1" ]; then
