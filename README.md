@@ -71,7 +71,11 @@ step is required. `rate-guard.sh` itself never calls any API.
    `statusLine.command` points to. If your status line does not already read
    `rate_limits`, uncomment the extraction lines at the top of
    `statusline-tee.sh`.
-3. Trigger one status-line render (any interaction). Confirm the state file
+3. (Recommended) Add `"refreshInterval": 60` to the `statusLine` block in
+   `~/.claude/settings.json`. The timer then fires the tee even while the main
+   loop sits silent waiting on background work, so the copy does not go stale
+   (effectively required for watchdog operation; see SPEC §8).
+4. Trigger one status-line render (any interaction). Confirm the state file
    appears:
 
    ```sh
@@ -114,13 +118,17 @@ sends nothing over the network, so there is nothing else to clean up.
 | `UNKNOWN` | `20` | state is missing, stale, or incomplete; **fail-open**: proceed, but flag that the remaining budget is unknown |
 
 Keys printed: `VERDICT`, `FIVE_HOUR_PCT`, `HEADROOM_PCT`, `RESETS_AT` (epoch),
-`RESETS_AT_HUMAN`, `SECONDS_TO_RESET`, `REASON`. `SECONDS_TO_RESET` is the wait
-until the reset, computed by the gate (`RESETS_AT - now`), so an agent can
-schedule a resume from it without knowing the current time (empty if the reset
-time is unknown, negative if it has already passed). `HEADROOM_PCT` is the room
-left up to the threshold (`threshold - usage`, floored at 0; empty on
-`UNKNOWN`) — compare your estimated consumption against it before a large
-launch. Numbers are printed with float artifacts stripped (`%g`, e.g.
+`RESETS_AT_HUMAN`, `SECONDS_TO_RESET`, `STATE_AGE_SECONDS`, `REASON`.
+`SECONDS_TO_RESET` is the wait until the reset, computed by the gate
+(`RESETS_AT - now`), so an agent can schedule a resume from it without knowing
+the current time (empty if the reset time is unknown, negative if it has
+already passed). `HEADROOM_PCT` is the room left up to the threshold
+(`threshold - usage`, floored at 0; empty on `UNKNOWN`) — compare your
+estimated consumption against it before a large launch. `STATE_AGE_SECONDS` is
+the age of the state copy (`now - written_at`; empty when `written_at` is
+missing or not a number) — use it to judge the freshness of a reading and to
+measure the burn rate from deltas between two points with different
+`written_at`. Numbers are printed with float artifacts stripped (`%g`, e.g.
 `14.000000000000002` → `14`) while keeping effective precision, so deltas stay
 measurable; the verdict is computed on the raw value.
 
@@ -132,6 +140,7 @@ HEADROOM_PCT=43
 RESETS_AT=1782200400
 RESETS_AT_HUMAN=06/23 16:40
 SECONDS_TO_RESET=4853
+STATE_AGE_SECONDS=12
 REASON=5h usage 37% < threshold 80%
 ```
 

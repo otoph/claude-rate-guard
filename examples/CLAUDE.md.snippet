@@ -18,7 +18,11 @@ calls are exempt).
     batches (below). Measure the unit cost with a small first batch instead of
     guessing it (a zero delta means "not yet measured", never "free"). If even
     the smallest batch does not fit, treat it as `DEFER`: schedule just after
-    `RESETS_AT` instead of silently holding.
+    `RESETS_AT` instead of silently holding. **A workflow whose fan-out (total
+    agent count) is unknown — prebuilt/named workflows especially — is
+    un-estimatable: pin down fan-out and unit cost with a small run first, and
+    estimate review-type workflows by their upper bound (candidates ×
+    verifier cost), not the average.**
   - `DEFER`: do **not** launch. Schedule a retry just after `RESETS_AT`
     (`SECONDS_TO_RESET + 120` gives the delay directly; within an hour, a short
     wakeup; further out, a one-shot cron), tell the user it is deferred, and
@@ -37,7 +41,12 @@ calls are exempt).
   On `DEFER` (or when the burn rate says the next tick would be too late), stop
   at a checkpoint (keep the journal) and schedule a resume after the reset. When
   it fires and the guard says `OK`, resume from the checkpoint. Repeat for each
-  window the run spans.
+  window the run spans. **On `UNKNOWN` (stale), never treat it as OK**: the
+  status line goes quiet exactly while the main loop waits on background work —
+  estimate "last known value + elapsed × burn rate" (from two readings with
+  different `written_at` / `STATE_AGE_SECONDS`; fall back to the pre-flight
+  unit cost) and stop as DEFER at or above the threshold. Setting
+  `"refreshInterval": 60` on the `statusLine` block removes the gap.
 
 - **Crash resilience:** persist resume information (script path, run id, batch
   progress, journal location) to `~/.claude/rate-guard/resume.json` at launch and

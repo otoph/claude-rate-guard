@@ -44,7 +44,8 @@
 
 1. `rate-guard.sh` を安定した場所（例：`~/.claude/scripts/rate-guard.sh`）に置き、`chmod +x` を実行します。
 2. **`statusline-tee.sh`** の本体を、`statusLine.command` が指すスクリプトに追記します。ステータス行がまだ `rate_limits` を読み取っていない場合は、`statusline-tee.sh` の冒頭にある読み取り行のコメントを外します。
-3. ステータス行の描画を1回起こします（何か操作すれば描画されます）。state ファイルができたことを確認します：
+3. （推奨）`~/.claude/settings.json` の `statusLine` に `"refreshInterval": 60` を追加します。メインループがバックグラウンド作業の完了待ちで沈黙していても、タイマーで tee が発火し、控えが古くなりません（watchdog 運用では実質必須。詳細は SPEC §8）。
+4. ステータス行の描画を1回起こします（何か操作すれば描画されます）。state ファイルができたことを確認します：
 
    ```sh
    cat ~/.claude/rate_limit_state.json
@@ -76,7 +77,7 @@
 | `DEFER`   | `10` | 利用率がしきい値以上。起動**しない**でリセットを待つ |
 | `UNKNOWN` | `20` | state が無い・古い・不完全。**fail-open**（起動するが、残量が不明であることを伝える） |
 
-出力するキー：`VERDICT` / `FIVE_HOUR_PCT` / `HEADROOM_PCT` / `RESETS_AT`（epoch）/ `RESETS_AT_HUMAN` / `SECONDS_TO_RESET` / `REASON`。`SECONDS_TO_RESET` はリセットまでの残り秒で、ゲートが `RESETS_AT − now` で算出します。エージェントは自分の現在時刻を知らなくても、この値で再開を予約できます（リセット時刻が不明なら空、すでに過ぎていれば負値）。`HEADROOM_PCT` はしきい値までの余裕（`しきい値 − 使用率`、負なら 0。`UNKNOWN` では空）で、大きな起動の前に推定消費と突き合わせます。数値は浮動小数の誤差（`14.000000000000002` 等）だけを除いた形で出力し、実質の精度は保ちます（前後差分の計測が可能）。判定は生値で行います。
+出力するキー：`VERDICT` / `FIVE_HOUR_PCT` / `HEADROOM_PCT` / `RESETS_AT`（epoch）/ `RESETS_AT_HUMAN` / `SECONDS_TO_RESET` / `STATE_AGE_SECONDS` / `REASON`。`SECONDS_TO_RESET` はリセットまでの残り秒で、ゲートが `RESETS_AT − now` で算出します。エージェントは自分の現在時刻を知らなくても、この値で再開を予約できます（リセット時刻が不明なら空、すでに過ぎていれば負値）。`HEADROOM_PCT` はしきい値までの余裕（`しきい値 − 使用率`、負なら 0。`UNKNOWN` では空）で、大きな起動の前に推定消費と突き合わせます。`STATE_AGE_SECONDS` は控えの経過秒（`now − written_at`。`written_at` が無い・数値でないときは空）で、読み値の鮮度の機械判定と、`written_at` が異なる 2 点の差分によるバーンレート実測に使います。数値は浮動小数の誤差（`14.000000000000002` 等）だけを除いた形で出力し、実質の精度は保ちます（前後差分の計測が可能）。判定は生値で行います。
 
 ```sh
 $ rate-guard.sh
@@ -86,6 +87,7 @@ HEADROOM_PCT=43
 RESETS_AT=1782200400
 RESETS_AT_HUMAN=06/23 16:40
 SECONDS_TO_RESET=4853
+STATE_AGE_SECONDS=12
 REASON=5h usage 37% < threshold 80%
 ```
 
