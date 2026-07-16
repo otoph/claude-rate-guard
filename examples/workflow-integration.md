@@ -100,11 +100,20 @@ For a job that can exceed one 5-hour window:
    before its first tick. The state is also only as fresh as the last
    status-line run, so the effective lag is interval + staleness.
 3. **Predictive stop (recommended)**: keep the previous `FIVE_HOUR_PCT`, derive
-   the burn rate from the last two readings, and if the threshold will be
-   reached before the next tick, stop now even below the threshold.
-4. On `DEFER`, stop the job at its next checkpoint (so no work is lost), then
+   the burn rate from the last two readings **whose `written_at`
+   (`STATE_AGE_SECONDS`) differ** — re-reading the same write looks like a zero
+   delta but is not zero consumption — and if the threshold will be reached
+   before the next tick, stop now even below the threshold.
+4. **On `UNKNOWN` (stale), do not treat it as OK.** The status line is
+   event-driven, so it goes quiet exactly while the main loop waits on
+   background work. Estimate "last known value + elapsed × burn rate" and stop
+   as DEFER at or above the threshold (fall back to your pre-flight unit-cost
+   estimate until two measured points exist). The permanent fix is
+   `"refreshInterval": 60` in the `statusLine` settings block, which keeps the
+   tee firing on a timer while idle.
+5. On `DEFER`, stop the job at its next checkpoint (so no work is lost), then
    schedule a resume just after `RESETS_AT`.
-5. When the resume fires, run the guard again; on `OK`, continue from the
+6. When the resume fires, run the guard again; on `OK`, continue from the
    checkpoint.
 
 Make the job's steps idempotent (or read-only) so an approximate stop point is

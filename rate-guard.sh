@@ -39,7 +39,7 @@ fmt_num() {
 }
 
 if [ ! -f "$STATE_FILE" ]; then
-  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "HEADROOM_PCT=" "RESETS_AT=" "RESETS_AT_HUMAN=" "SECONDS_TO_RESET=" \
+  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "HEADROOM_PCT=" "RESETS_AT=" "RESETS_AT_HUMAN=" "SECONDS_TO_RESET=" "STATE_AGE_SECONDS=" \
        "REASON=state file not found ($STATE_FILE); statusLine.command unset or tee not run yet"
   exit 20
 fi
@@ -53,27 +53,29 @@ pct_disp=$(fmt_num "$pct")
 
 case "$written" in
   ''|*[!0-9]*)
-    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
+    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" "STATE_AGE_SECONDS=" \
          "REASON=state malformed (written_at missing or non-numeric); statusline tee may be broken (see ~/.claude/rate-guard.tee.log)"
     exit 20 ;;
 esac
+# 控えの経過秒。呼び出し側はこの値と FIVE_HOUR_PCT の履歴からバーンレートを実測できる
+# （written_at が異なる 2 点で差分を取る。FR-08 の UNKNOWN 分岐・先読み DEFER の材料）。
+age=$(( now - written ))
 if [ -z "$pct" ]; then
-  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
+  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" "STATE_AGE_SECONDS=${age}" \
        "REASON=rate_limits absent (five_hour.used_percentage null); non Pro/Max or before first API response -- gate inoperative here"
   exit 20
 fi
 # 非数値の used_percentage は 0 と誤読して OK を返さず、破損として UNKNOWN に倒す
 case "$pct" in
   *[!0-9.]*|*.*.*|.)
-    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
+    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" "STATE_AGE_SECONDS=${age}" \
          "REASON=state malformed (used_percentage non-numeric); statusline tee may be broken (see ~/.claude/rate-guard.tee.log)"
     exit 20 ;;
 esac
 
-age=$(( now - written ))
 if [ "$age" -gt "$STALE_SECONDS" ]; then
-  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
-       "REASON=state stale (${age}s > ${STALE_SECONDS}s); if mid-session the statusline tee may be broken (see ~/.claude/rate-guard.tee.log)"
+  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" "STATE_AGE_SECONDS=${age}" \
+       "REASON=state stale (${age}s > ${STALE_SECONDS}s); statusline had no UI event (happens while waiting on background work -- see statusLine.refreshInterval) or tee broken (see ~/.claude/rate-guard.tee.log)"
   exit 20
 fi
 
@@ -82,11 +84,11 @@ headroom=$(awk -v p="$pct" -v t="$THRESHOLD" 'BEGIN{h=t-p; if(h<0)h=0; printf "%
 
 over=$(awk -v p="$pct" -v t="$THRESHOLD" 'BEGIN{print (p+0 >= t+0) ? 1 : 0}')
 if [ "$over" = "1" ]; then
-  emit "VERDICT=DEFER" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=${headroom}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
+  emit "VERDICT=DEFER" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=${headroom}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" "STATE_AGE_SECONDS=${age}" \
        "REASON=5h usage ${pct_disp}% >= threshold ${THRESHOLD}%; defer launch until reset"
   exit 10
 fi
 
-emit "VERDICT=OK" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=${headroom}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
+emit "VERDICT=OK" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=${headroom}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" "STATE_AGE_SECONDS=${age}" \
      "REASON=5h usage ${pct_disp}% < threshold ${THRESHOLD}%"
 exit 0

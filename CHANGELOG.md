@@ -4,6 +4,39 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Follow-ups from a field report (a watchdog whose readings went stale mid-run)
+and a window-exhaustion incident (a prebuilt 27-agent workflow launched at 9%).
+
+### Added
+- `STATE_AGE_SECONDS` in the gate output: the age of the state copy
+  (`now - written_at`; empty when `written_at` is missing or not a number).
+  Judge the freshness of a reading mechanically, and measure the burn rate
+  from deltas between two points with different `written_at`.
+- Spec: an `UNKNOWN` (stale) branch in the mid-run watchdog loop (FR-08,
+  Appendix B) — never treat a stale reading as OK; estimate "last known value
+  + elapsed × burn rate" conservatively and stop as DEFER at or above the
+  threshold. Shell-loop watchdogs sever the implicit refresh that agent
+  wake-ups provide, so they require this branch or `refreshInterval`.
+- Spec: `statusLine.refreshInterval` documented and recommended for watchdog
+  operation (§8, Appendix A-1, README install) — verified on Claude Code
+  2.1.211: takes effect without a session restart and fires while the main
+  loop is fully idle.
+- Spec: treat a workflow whose fan-out is unknown as un-estimatable, and
+  estimate review-type workflows with an upper bound (candidate count ×
+  verifier unit cost) (FR-06, §12) — from a field incident (27 agents,
+  ~1.58M tokens ≈ 70 points, 9% → 100% mid-run).
+- Spec: multi-session reading jitter documented — the state carries the
+  writing session's last API response values, so concurrent sessions
+  interleave non-monotonic readings; measure unit costs with one session
+  only (§8, FR-06, §12).
+
+### Changed
+- The stale `REASON` now names the common real cause — no UI event while the
+  main loop waits on background work, pointing at `statusLine.refreshInterval`
+  — instead of only suspecting a tee failure (FR-04).
+
 ## [0.2.0] - 2026-07-06
 
 Hardening from a large-scale field test (a ~300-subagent workflow spanning four
@@ -76,5 +109,6 @@ First public release.
 - `.github/workflows/shellcheck.yml`: runs ShellCheck on every push and pull
   request.
 
+[Unreleased]: https://github.com/otoph/claude-rate-guard/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/otoph/claude-rate-guard/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/otoph/claude-rate-guard/releases/tag/v0.1.0

@@ -144,8 +144,9 @@
   - `used_percentage < しきい値` → `VERDICT=OK`、exit **0**
   - `used_percentage >= しきい値` → `VERDICT=DEFER`、exit **10**（同じ値のときは DEFER 側）
   - 材料が欠ける or 古い → `VERDICT=UNKNOWN`、exit **20**
-- **出力は機械が読める `KEY=VALUE` 行**（標準出力）：`VERDICT` / `FIVE_HOUR_PCT` / `HEADROOM_PCT` / `RESETS_AT` / `RESETS_AT_HUMAN` / `SECONDS_TO_RESET` / `REASON`。`SECONDS_TO_RESET` は実行時にゲートが算出する `RESETS_AT − now`（リセット時刻が不明なら空、すでに過ぎていれば負値）。エージェントは自分の時計が無くても、この値で再開を予約できる。
+- **出力は機械が読める `KEY=VALUE` 行**（標準出力）：`VERDICT` / `FIVE_HOUR_PCT` / `HEADROOM_PCT` / `RESETS_AT` / `RESETS_AT_HUMAN` / `SECONDS_TO_RESET` / `STATE_AGE_SECONDS` / `REASON`。`SECONDS_TO_RESET` は実行時にゲートが算出する `RESETS_AT − now`（リセット時刻が不明なら空、すでに過ぎていれば負値）。エージェントは自分の時計が無くても、この値で再開を予約できる。
 - **`HEADROOM_PCT` ＝ 閾値までの余裕**（`しきい値 − used_percentage`、負なら `0`）。予算比較（FR-06）の右辺に使う。`OK`/`DEFER` のときだけ値を持ち、`UNKNOWN` では空。基準は 100% でなく **しきい値** であることに注意（しきい値までの余白は対話ターン用の予約として残す設計・FR-06）。
+- **`STATE_AGE_SECONDS` ＝ 控えの経過秒**（実行時に算出する `now − written_at`。`written_at` が欠ける・数値でないときは空）。読み値の鮮度を機械判定できる。`written_at` が異なる 2 回の実行の `FIVE_HOUR_PCT` 差分と合わせるとバーンレート（pt/分）を実測できる（FR-08 の先読み DEFER・UNKNOWN 分岐の材料。**同じ write の再読は差分 0 に見えるだけで消費ゼロではない**ため、必ず `written_at` の異なる 2 点で差分を取る）。
 - **表示の整形**：`FIVE_HOUR_PCT` / `HEADROOM_PCT` は `%g`（6有効桁）で整形し、サーバ値の浮動小数アーティファクト（例 `14.000000000000002` → `14`）だけを除去する。実質の精度は保たれるため、**前後差分による計測（FR-06 の計測バッチ）を壊さない**。判定は整形前の生値で行い、表示と食い違う極端な境界では `VERDICT` が正。数値出力はロケールに依存しない（`LC_ALL=C`・小数点は常にピリオド）。
 - 小数の比較は `awk` などで行う（bash の整数比較に丸めない）。
 - **LLM を一切使わない**（判定と計算はコードで行う）。
@@ -160,7 +161,7 @@
   - `written_at` が欠ける・数値でない → 「state の破損／tee の故障の疑い（`rate-guard.tee.log` を参照）」。計算の前に整数かを確認し、数値でなくてもクラッシュせず UNKNOWN を返す
   - `used_percentage` が `null` → 「**rate_limits が無い＝非 Pro/Max または初回応答前**。ここではゲートは効かない」（構造的・恒久の可能性）
   - `used_percentage` が数値でない → 「state の破損／tee の故障の疑い」。**0 と誤読して `OK`（満額の `HEADROOM_PCT`）を返してはならない**
-  - 古い → 「古い。**対話中なら tee の故障の疑い**（`rate-guard.tee.log` を参照）」（一時 or 故障）
+  - 古い → 「古い。**UI イベントが無く statusline が発火していない**（放置だけでなく、メインループがバックグラウンド完了待ちで沈黙する対話セッションでも起きる。§8 の `refreshInterval` で解消可）か、tee の故障の疑い（`rate-guard.tee.log` を参照）」（一時 or 故障）
 
 ### FR-05 設定パラメータ（環境変数で上書き可）
 
@@ -193,6 +194,8 @@ scope-(i) で **1本まるごと回る長時間ワークフローを起動する
 - **推定単価は実測で適応させる**：静的な仮定ではなく、最初に小さな計測バッチを流し、前後の `FIVE_HOUR_PCT` の差から pt/ユニットを求め、以降のバッチサイズを決める。単価はモデル構成で数倍変わる（実測で約 2.7 倍差）。
 - **`FIVE_HOUR_PCT` の鮮度に注意**：state の更新は statusline の実行（新しいアシスタントメッセージ等・§8）に依存する。バックグラウンド走行中は監視の起床がその契機になるため、計測値は「最後に statusline が動いた時点」の値である。
 - **計測差分が 0 のときは単価 0 としない**：直前の項の遅れにより、計測バッチ直後の読み取りには消費が未反映のことがある。差分 0 は「タダ」ではなく「未計測」。state の更新後に読み直すか、計測バッチを大きくする。**単価 0 のままサイズ計算に進んではならない**（`0 × 何でも ≦ 余裕` が常に成立し、バッチが無制限になる）。
+- **fan-out（総エージェント数）が不明なワークフローは見積不能として扱う**：既成・名前付き workflow の fan-out は自作の桁上になりうる（実測：検証型 code-review workflow（high・70 ファイル diff）＝ 27 エージェント・約 158 万トークン ≒ 70pt。使用 9% で `OK` を得て起動したが走行中に 100% へ到達し、in-flight の統合ステップを失った）。`VERDICT=OK` だけで起動せず、小さな計測実行で単価と fan-out を確定してから予算比較する。所見数に応じて verifier が事後に増える構成（レビュー系など）は、平均でなく**上限系（候補数 × verifier 単価）**で見積もる。
+- **読み値のジッターに注意（複数セッション併用時）**：state は「最後に statusline を実行したセッションが、最後の API 応答で見た値」で上書きされる（§8）。複数セッションを併用すると鮮度の異なる値が交互に書かれ、`FIVE_HOUR_PCT` は数 pt 規模で非単調に行き来する（実測）。単価計測（前後差分）は自セッションだけが消費している状態で行い、負の差分は 0 でなく「計測不成立」として測り直す。
 - **最小バッチすら収まらないときは DEFER 扱い**：`VERDICT=OK` でも `HEADROOM_PCT` が最小のバッチに満たない場合（しきい値の直下では 0 に近づく）は、DEFER と同じ手順（FR-07）で `RESETS_AT` 直後へ次の起動を予約する。OK のまま黙って保留し続けない（黙った先送りは NFR-07 違反）。
 - **余白は意図的に二重**：安全係数 1.3（見積もり誤差の吸収）に加えて、しきい値（既定 80）が 100% までの 20pt を対話ターン用に予約する。重ね掛けは意図的であり、どちらか一方を外さない。
 
@@ -212,6 +215,7 @@ pre-flight（FR-06）は「残りが少ないときに *始めない*」だけ�
 - **監視（ポーリング）**：エージェントが一定間隔で起き、`rate-guard.sh` を実行する。
   - `OK` かつ実行中 → 次の監視を再予約。
   - `DEFER`（≥しきい値）かつ実行中 → **`TaskStop(runId)`**（journal は保たれる）→ `RESETS_AT` を記録し、再開を予約（FR-07 と同じ手順）。
+  - **`UNKNOWN`（古い等）かつ実行中 → OK 扱いにしない（1 読み値で楽観しない）**。最後に既知の `FIVE_HOUR_PCT` に「経過時間 × バーンレート」を足して現在値を保守的に推定し、推定がしきい値以上なら DEFER と同じ手順で停止する。バーンレートは **`written_at`（`STATE_AGE_SECONDS`）が異なる 2 点**の差分から実測する。実測 2 点がまだ無ければ、pre-flight の予算比較（FR-06）で用いた推定単価から導いた値で代用する。statusline はイベント駆動のため（§8）、メインループが完了待ちで沈黙すると tee は発火せず、**監視が必要な長い走行ほど確実に stale 化する**（実測）。恒久対処は `statusLine.refreshInterval`（§8）。
   - 完了の通知を受けた → ループ終了（成果物を回収）。
 - **監視間隔は式で決める（固定の「◯分」にしない）**：しきい値到達から 100% までの余白を、バーンレートが食い切る前に必ず1回は起きる必要がある。
 
@@ -268,7 +272,7 @@ FR-07/08 の予約（wakeup・セッション限定 cron）と `TaskStop`/`resum
 ## 7. インターフェースの取り決め（壊してはいけない約束）
 
 1. **state ファイルの形式**（FR-02）。キー名・`written_at` の epoch 秒・`null` 許容を変えない。
-2. **ゲートの標準出力の取り決め**：`KEY=VALUE` 行・キー名 `VERDICT/FIVE_HOUR_PCT/HEADROOM_PCT/RESETS_AT/RESETS_AT_HUMAN/SECONDS_TO_RESET/REASON`（`HEADROOM_PCT` は v0.2.0 で追加）。キーの**追加**は可（既存キー名は変えない）。
+2. **ゲートの標準出力の取り決め**：`KEY=VALUE` 行・キー名 `VERDICT/FIVE_HOUR_PCT/HEADROOM_PCT/RESETS_AT/RESETS_AT_HUMAN/SECONDS_TO_RESET/STATE_AGE_SECONDS/REASON`（`HEADROOM_PCT` は v0.2.0、`STATE_AGE_SECONDS` は 2026-07 に追加）。キーの**追加**は可（既存キー名は変えない）。
 3. **終了コード**：`0=OK / 10=DEFER / 20=UNKNOWN`。呼び出し側はこのコードで分岐してよい。
 4. データの流れは一方向（§4）。ゲートは state を **読み取り専用** とし、書き換えない。
 
@@ -277,7 +281,9 @@ FR-07/08 の予約（wakeup・セッション限定 cron）と `TaskStop`/`resum
 ## 8. 導入時の前提と差分（**導入前に必ず確認**）
 
 - **いちばん大事な前提（見えること）**：対象の Claude Code が statusline の標準入力に `rate_limits.five_hour.used_percentage` / `resets_at` を **実際に渡しているか** を最初に確認する（`statusLine.command` に echo のデバッグを入れる／作られた state ファイルを見る）。渡されない環境（§2.4 の切り替わり条件）では、本ツールは恒久 `UNKNOWN`（fail-open）に切り替わり、ゲートは機能しない。
-- **statusline が動く条件（公式）**：`statusLine.command` は **新しいアシスタントのメッセージ後・`/compact` 完了時・パーミッションモード変更時・Vim モード切替時** に実行され、更新は 300ms ぶんまとめられる。**未設定なら一切実行されない**。これらは対話 UI の操作であり、headless/print モードでは動かない前提で設計する（§2.4）。
+- **statusline が動く条件（公式）**：`statusLine.command` は **新しいアシスタントのメッセージ後・`/compact` 完了時・パーミッションモード変更時・Vim モード切替時** に実行され、更新は 300ms ぶんまとめられる。**未設定なら一切実行されない**。これらは対話 UI の操作であり、headless/print モードでは動かない前提で設計する（§2.4）。公式も「メインセッションがアイドルの間（バックグラウンドのサブエージェント待ちなど）はこれらのトリガーが沈黙する」と明記しており、**長い走行の監視中こそ tee が止まる**（FR-08・§10）。
+- **タイマー再実行 `statusLine.refreshInterval`（公式・watchdog 運用では推奨）**：秒単位（最小 1）で、イベント駆動に加えて一定間隔でも statusline を再実行する設定。上記のアイドル空白への公式の対処であり、tee もタイマーで発火する。実測（Claude Code 2.1.211）：設定はセッション再起動なしで反映され、メインループが完全アイドルでもタイマーが発火した。watchdog（FR-08）を使う運用では 60 秒程度を推奨。
+- **stdin の `rate_limits` は「そのセッションが最後の API 応答で見た値」（実測）**：タイマー再実行は control 入力を新しく取得するのではなく、セッションが保持する最新値を書く。走行中のセッションでは値も新鮮に保たれる一方、**何も実行していないセッションのタイマーは、古い値を新しい `written_at` で上書きする**。複数セッション併用時はこの混在で `FIVE_HOUR_PCT` が非単調になる（±数 pt の行き来を実測。FR-06 のジッター注意）。`written_at` の新しさは「tee が動いた時刻」であって「値の新しさ」の保証ではない、と理解して読むこと。
 - **`rate_limits` が来る条件（公式）**：`rate_limits` は **Claude.ai Pro/Max 利用者の初回 API 応答後** に標準入力へ現れる。`five_hour` / `seven_day` はそれぞれ欠けることがある。API キー課金の利用者には来ない。
 - **見えるバーは独立（公式）**：スクリプトが標準出力に何も出さなくても statusline コマンドは実行され、ファイル書き込みなどの副作用は走る。よって **見えるバーを出さない運用でも tee は機能する**。
 - **フィールドの場所は版に依存**：上記のキー名は Claude Code の版で変わりうる。実環境の標準入力 JSON を実際に見て確定すること。
@@ -316,6 +322,8 @@ FR-07/08 の予約（wakeup・セッション限定 cron）と `TaskStop`/`resum
 | 21 | `used_percentage=79.96`, しきい値 80 | `VERDICT=OK`・`FIVE_HOUR_PCT=79.96`・`HEADROOM_PCT=0.04`（`%g` 整形は実質の精度を保ち、差分計測を壊さない） |
 | 22 | `used_percentage` が数値でない（`"abc"` 等） | `UNKNOWN` / exit 20（0 に強制変換して `OK`・満額 `HEADROOM_PCT` を返さない） |
 | 23 | 小数点がカンマのロケール（例 `LC_ALL=de_DE.UTF-8`）で実行 | 数値出力の小数点はピリオドのまま（`LC_ALL=C` 固定・FR-03） |
+| 24 | `written_at` が数値の各系（OK / DEFER / 古い / `used_percentage` が null・非数値） | `STATE_AGE_SECONDS` が `now − written_at` に一致（「古い」系では REASON の経過秒と同値） |
+| 25 | state ファイル無し／`written_at` が欠ける・数値でない | `STATE_AGE_SECONDS=`（空） |
 
 ---
 
@@ -327,7 +335,7 @@ FR-07/08 の予約（wakeup・セッション限定 cron）と `TaskStop`/`resum
 - **mid-run の停止は区切りを保証しない**：外部からの監視で止めるため、中断位置は決まらない。中断したエージェントは再開でやり直すので、読み取りだけのワークフローは無害だが、書き込みなどを伴うものは冪等キーが前提。
 - **検出のみで強制しない**：強制（フックで止める）は別途の判断（付録 C）。本書は「エージェントが自分で見る」前提。
 - **対象は scope-(i) のみ**：dispatcher 管理のタスクは対象外。
-- **放置中に古くなる**：描画が止まると控えが古くなる。ただしゲートの対象は動いているワークフローなので実害は小さく、新しさの判定（FR-04）が UNKNOWN で吸収する。
+- **UI イベントが無いと控えが古くなる**：statusline はイベント駆動（§8）のため、放置中だけでなく、**メインループがバックグラウンド完了待ちで沈黙する対話セッションでも tee は発火せず、控えが古くなる**。watchdog が監視すべき長い走行ほどこの空白が確実に開く（実測：約 29 分の走行中に監視 4 tick 連続で UNKNOWN 化、その裏でも消費は進行していた）。`statusLine.refreshInterval`（§8）で解消できる。未設定の環境では新しさの判定（FR-04）が UNKNOWN で吸収し、FR-08 の UNKNOWN 分岐で保守的に扱う。
 - **正式な値だが版に依存**：値はサーバが返すもので推定ではないが、標準入力の形式は Claude Code の版に依存する（§8）。
 
 ---
@@ -355,6 +363,8 @@ statusline 未設定の環境を起点に、最小の手数で導入する。す
 - **切り離したサブプロセスには自衛させる**：ワークフローが `TaskStop` で死なない外部プロセスを起動するなら、**そのプロセス自身に最大実行時間／自己ゲートを持たせる**。セッションを閉じると監視者（エージェント）はいなくなるため、監視者がいなくても自分で止まれること。
 - **監視間隔は式で決め、リセット境界はバックオフ**：各起き上がりはトークンを消費するので間隔は分単位にしつつ、上限は FR-08 の式（`(100 − しきい値) ÷ 最大バーンレート`）を超えないこと。リセット推定のずれによる thrash は再確認のガード＋バックオフで抑える（NFR-08）。
 - **重い単発ワークフローは余白を取る**：pre-flight は起動時点の使用率しか見ず、ワークフローの消費量は知らない。1つの枠を食いうるワークフローは **予算比較（FR-06）とバッチ分割（FR-09）で収まる大きさに切る** のが第一。分割できない単発は、しきい値を下げて余白を確保（例 80→60）するか、**FR-08 watchdog 前提**に切り替える。
+- **既成・名前付き workflow は fan-out を確かめてから起動する**：自作の消費感覚を桁違いの fan-out に外挿しない（使用 9% で起動した検証型レビュー workflow が 27 エージェントで 100% に到達した実測がある・FR-06）。
+- **計測は自セッション単独で**：単価・バーンレートの計測（前後差分）は、他セッションが消費していない状態で行う。state は「最後に statusline を実行したセッションの最終 API 応答値」で上書きされ、複数セッション併用では読み値が非単調にぶれる（§8・FR-06）。
 - **スクリプト・中間成果物は永続ディレクトリに**：`/tmp` はクラッシュ・再起動で失われる（FR-10）。再開情報（resume.json）はバッチ境界ごとに更新する。
 - **しきい値は環境変数で渡す**：恒久的な変更を `settings.json` などに固定すると、ふだんの使用率より低いしきい値で **リセット後にまたしきい値を超え→恒久 DEFER で詰む**。しきい値の変更は、ゲート呼び出し時の環境変数（その場限り）にとどめる。
 
@@ -411,12 +421,15 @@ exit 0   # tee 失敗・見えるバーの短絡で非ゼロ終了 → statuslin
 {
   "statusLine": {
     "type": "command",
-    "command": "~/.claude/statusline-command.sh"
+    "command": "~/.claude/statusline-command.sh",
+    "refreshInterval": 60
   }
 }
 ```
 
 > 既存の statusline がある環境では、配線は変えず、その既存コマンドの中に上記「tee」ブロックだけを追記する。抽出（`five_pct` など）が未定義なら、抽出行もあわせて追記する。
+>
+> `refreshInterval`（秒）は任意だが、**watchdog 運用（FR-08・付録 B）では設定を推奨**：メインループがバックグラウンド完了待ちで沈黙していても、タイマーで tee が発火し、控えが stale 化しない（§8）。
 
 ### A-2. `rate-guard.sh`（判定スクリプト全文）
 
@@ -460,7 +473,7 @@ fmt_num() {
 }
 
 if [ ! -f "$STATE_FILE" ]; then
-  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "HEADROOM_PCT=" "RESETS_AT=" "RESETS_AT_HUMAN=" "SECONDS_TO_RESET=" \
+  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "HEADROOM_PCT=" "RESETS_AT=" "RESETS_AT_HUMAN=" "SECONDS_TO_RESET=" "STATE_AGE_SECONDS=" \
        "REASON=state file not found ($STATE_FILE); statusLine.command unset or tee not run yet"
   exit 20
 fi
@@ -474,27 +487,29 @@ pct_disp=$(fmt_num "$pct")
 
 case "$written" in
   ''|*[!0-9]*)
-    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
+    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" "STATE_AGE_SECONDS=" \
          "REASON=state malformed (written_at missing or non-numeric); statusline tee may be broken (see ~/.claude/rate-guard.tee.log)"
     exit 20 ;;
 esac
+# 控えの経過秒。呼び出し側はこの値と FIVE_HOUR_PCT の履歴からバーンレートを実測できる
+# （written_at が異なる 2 点で差分を取る。FR-08 の UNKNOWN 分岐・先読み DEFER の材料）。
+age=$(( now - written ))
 if [ -z "$pct" ]; then
-  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
+  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" "STATE_AGE_SECONDS=${age}" \
        "REASON=rate_limits absent (five_hour.used_percentage null); non Pro/Max or before first API response -- gate inoperative here"
   exit 20
 fi
 # 非数値の used_percentage は 0 と誤読して OK を返さず、破損として UNKNOWN に倒す
 case "$pct" in
   *[!0-9.]*|*.*.*|.)
-    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
+    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" "STATE_AGE_SECONDS=${age}" \
          "REASON=state malformed (used_percentage non-numeric); statusline tee may be broken (see ~/.claude/rate-guard.tee.log)"
     exit 20 ;;
 esac
 
-age=$(( now - written ))
 if [ "$age" -gt "$STALE_SECONDS" ]; then
-  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
-       "REASON=state stale (${age}s > ${STALE_SECONDS}s); if mid-session the statusline tee may be broken (see ~/.claude/rate-guard.tee.log)"
+  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" "STATE_AGE_SECONDS=${age}" \
+       "REASON=state stale (${age}s > ${STALE_SECONDS}s); statusline had no UI event (happens while waiting on background work -- see statusLine.refreshInterval) or tee broken (see ~/.claude/rate-guard.tee.log)"
   exit 20
 fi
 
@@ -503,12 +518,12 @@ headroom=$(awk -v p="$pct" -v t="$THRESHOLD" 'BEGIN{h=t-p; if(h<0)h=0; printf "%
 
 over=$(awk -v p="$pct" -v t="$THRESHOLD" 'BEGIN{print (p+0 >= t+0) ? 1 : 0}')
 if [ "$over" = "1" ]; then
-  emit "VERDICT=DEFER" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=${headroom}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
+  emit "VERDICT=DEFER" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=${headroom}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" "STATE_AGE_SECONDS=${age}" \
        "REASON=5h usage ${pct_disp}% >= threshold ${THRESHOLD}%; defer launch until reset"
   exit 10
 fi
 
-emit "VERDICT=OK" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=${headroom}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
+emit "VERDICT=OK" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=${headroom}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" "STATE_AGE_SECONDS=${age}" \
      "REASON=5h usage ${pct_disp}% < threshold ${THRESHOLD}%"
 exit 0
 ```
@@ -529,11 +544,16 @@ launch:  runId = Workflow(scriptPath, run_in_background=true)
 
 監視ループ（式で決めた間隔で起き・各回 rate-guard.sh を実行）:
   ※ 間隔の上限 = (100 − しきい値) ÷ 最大バーンレート（FR-08）
-  VERDICT=OK    かつ 実行中  → バーンレートを計算（前回 FIVE_HOUR_PCT との差分）
+  VERDICT=OK    かつ 実行中  → バーンレートを計算（written_at が異なる 2 点の FIVE_HOUR_PCT 差分。
+                               STATE_AGE_SECONDS で同じ write の再読を除外）
                                到達予測 < tick間隔 なら DEFER と同じ手順（先読み停止）
                                そうでなければ次の監視を再予約
   VERDICT=DEFER かつ 実行中  → TaskStop(runId)              # journal は保たれる
                                RESETS_AT を記録し再開を予約（FR-07 と同じ手順）
+  VERDICT=UNKNOWN(古い) かつ 実行中
+                             → OK 扱いにしない。最後の既知値 ＋ 経過時間 × バーンレート で保守的に推定し、
+                               しきい値以上なら DEFER と同じ手順で停止（実測 2 点がまだ無ければ
+                               pre-flight の見積単価から導いたバーンレートで代用・FR-08）
   完了の通知を受けた         → ループ終了（成果物を回収・resume.json を完了に更新）
 
 resume（予約発火時）:
@@ -547,6 +567,7 @@ resume（予約発火時）:
 - **80% で能動的に止める価値**：100% の枠切れを待つと、Workflow の `agent()` がリトライ後に `null` に握りつぶされ、**縮退した結果が黙って返る**（黙った打ち切り）。しきい値での `TaskStop` はきれいに中断し journal を残すので、これを避けられる。
 - **間隔は式で決める**：固定の「◯分」は高並列フリートに届かないことがある（20 分間隔では最初の tick 前に全損した実測がある）。上限は `(100 − しきい値) ÷ 最大バーンレート`。state の鮮度（最後に statusline が動いた時点）のぶん実効の遅れが加わることも見込む（FR-08）。
 - **先読み DEFER**：前回 tick の `FIVE_HOUR_PCT` を控え、バーンレートから「次の tick では手遅れ」と予測できるなら、しきい値未達でも停止する（FR-08）。
+- **stale 空白と監視の形態**：エージェント起床型（`ScheduleWakeup` 等）の監視は、起床時のアシスタントメッセージ自体が statusline を発火させ、控えを更新する副作用を持つ（§8）。これをシェルの常駐ループなどに置き換えると、トークン消費は減るが**この暗黙の更新経路が切れて stale を自ら招く**（実測：走行監視中に 4 tick 連続 UNKNOWN）。シェルループ型を使う場合は `statusLine.refreshInterval`（§8）の設定か、UNKNOWN 分岐（FR-08）の実装を必須とする。
 - **停止位置は決まらない**：外部からの監視なので区切り（phase 境界）では止まらない。中断時に走っていたエージェントは再開でやり直す。**読み取りだけのワークフロー（コードレビューなど）は無害**。書き込み（ファイル/外部投稿/DB 更新/アップロード）を伴うものは、冪等キー（request_hash/batch_id など＝疎結合の取り決め#4）で二重実行を吸収できる範囲に限る。
 - **再開の前提**：スクリプトは決定的であること（`Date.now()`/乱数に依存しない）。同じ script ＋同じ args なら、完了済みのエージェントは 100% キャッシュから戻る。`resumeFromRunId` は **同一セッション限定**。クラッシュ後は FR-10 の経路（journal を読んで継続スクリプトを書き起こす）へ切り替える。
 - **切り離したサブプロセス**：ワークフローが外部プロセスを起動する場合、それは `TaskStop` で死なない。再開時は再起動でなく、**既存の目印/ロック（PID の生存）を監視** して続行する（切り離し＋監視 方式）。

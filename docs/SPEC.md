@@ -146,8 +146,9 @@ Default path: `~/.claude/rate_limit_state.json`.
   - `used_percentage < threshold` → `VERDICT=OK`, exit **0**
   - `used_percentage >= threshold` → `VERDICT=DEFER`, exit **10** (an equal value is on the DEFER side)
   - material missing or stale → `VERDICT=UNKNOWN`, exit **20**
-- **The output is machine-readable `KEY=VALUE` lines** (standard output): `VERDICT` / `FIVE_HOUR_PCT` / `HEADROOM_PCT` / `RESETS_AT` / `RESETS_AT_HUMAN` / `SECONDS_TO_RESET` / `REASON`. `SECONDS_TO_RESET` is `RESETS_AT - now` computed by the gate at run time (empty if the reset time is unknown, negative if it has already passed); an agent can schedule a resume from it without its own clock.
+- **The output is machine-readable `KEY=VALUE` lines** (standard output): `VERDICT` / `FIVE_HOUR_PCT` / `HEADROOM_PCT` / `RESETS_AT` / `RESETS_AT_HUMAN` / `SECONDS_TO_RESET` / `STATE_AGE_SECONDS` / `REASON`. `SECONDS_TO_RESET` is `RESETS_AT - now` computed by the gate at run time (empty if the reset time is unknown, negative if it has already passed); an agent can schedule a resume from it without its own clock.
 - **`HEADROOM_PCT` = the headroom up to the threshold** (`threshold - used_percentage`, floored at `0`). It is the right-hand side of the budget comparison (FR-06). It carries a value only on `OK`/`DEFER` and is empty on `UNKNOWN`. Note the base is the **threshold**, not 100% (the margin between the threshold and 100% is deliberately reserved for interactive turns, FR-06).
+- **`STATE_AGE_SECONDS` = the age of the copy in seconds** (`now - written_at`, computed at run time; empty when `written_at` is missing or not a number). It lets the caller judge the freshness of a reading mechanically. Combined with the `FIVE_HOUR_PCT` delta between two runs whose `written_at` differ, it gives a measured burn rate (points/minute) — the material for the predictive DEFER and the UNKNOWN branch of FR-08. **Re-reading the same write only looks like a delta of 0; it does not mean zero consumption** — always take the delta between two points with different `written_at`.
 - **Display formatting**: `FIVE_HOUR_PCT` / `HEADROOM_PCT` are printed through `%g` (6 significant digits), which strips only the float artifacts of the server value (for example `14.000000000000002` → `14`). Effective precision is kept, so **delta-based measurement (the FR-06 measurement batch) is not broken**. The verdict is computed on the raw value; in an extreme boundary case where the display disagrees, `VERDICT` is authoritative. Numeric output is locale-independent (`LC_ALL=C`; the decimal separator is always a period).
 - Compare decimals with `awk`, etc. (do not round to a bash integer comparison).
 - **Use no LLM at all** (decision and calculation are done in code).
@@ -162,7 +163,7 @@ Default path: `~/.claude/rate_limit_state.json`.
   - `written_at` missing or not a number → "suspected state corruption / tee failure (see `rate-guard.tee.log`)". Check that it is an integer before calculating, and return UNKNOWN without crashing even when it is not a number
   - `used_percentage` is `null` → "**rate_limits absent = non Pro/Max or before the first response**. The gate does not work here" (possibly structural and permanent)
   - `used_percentage` is not a number → "suspected state corruption / tee failure". **It must not be misread as 0 and return `OK` (with the full `HEADROOM_PCT`)**
-  - stale → "stale. **If mid-session, suspect a tee failure** (see `rate-guard.tee.log`)" (temporary or a failure)
+  - stale → "stale. **The status line had no UI event** (this happens not only after idle time but also in an interactive session whose main loop sits silent waiting on background work; `refreshInterval` in §8 removes it), or suspect a tee failure (see `rate-guard.tee.log`)" (temporary or a failure)
 
 ### FR-05 Configuration parameters (overridable with environment variables)
 
@@ -195,6 +196,8 @@ A plain comparison against the threshold sees only "what is left at launch time"
 - **Adapt the unit cost from measurement**: instead of a static assumption, first run a small measurement batch, derive points-per-unit from the change in `FIVE_HOUR_PCT`, and size the following batches from it. The unit cost varies severalfold with the model configuration (about 2.7x measured).
 - **Mind the freshness of `FIVE_HOUR_PCT`**: the state updates only when the status line runs (a new assistant message, etc., §8). While a run is in the background, the monitor's wake-ups are what trigger it, so a reading is "as of the last time the status line ran".
 - **A measured delta of 0 does not mean a unit cost of 0**: because of the lag above, a reading taken right after the measurement batch may not reflect its consumption yet. A zero delta means "not yet measured", not "free". Re-read after the state updates, or use a larger measurement batch. **Never proceed to batch sizing with a unit cost of 0** (`0 × anything ≤ headroom` always holds and the batch becomes unbounded).
+- **Treat a workflow whose fan-out (total agent count) is unknown as un-estimatable**: the fan-out of a prebuilt or named workflow can be an order of magnitude above your own (measured: a verifying code-review workflow (high, 70-file diff) = 27 agents, about 1.58M tokens ≈ 70 points; launched on `OK` at 9% usage, it hit 100% mid-run and lost the in-flight consolidation step). Do not launch on `VERDICT=OK` alone; pin down the unit cost and the fan-out with a small measurement run first, then do the budget comparison. For structures where verifiers multiply with the number of findings (review-type workflows), estimate with an **upper bound (candidate count × verifier unit cost)**, not the average.
+- **Mind reading jitter (when several sessions run concurrently)**: the state is overwritten with "what the session that last ran the status line saw in its last API response" (§8). With several concurrent sessions, values of different freshness are written in turns, and `FIVE_HOUR_PCT` moves back and forth non-monotonically by a few points (measured). Do unit-cost measurement (before/after delta) while your session is the only one consuming, and treat a negative delta as "measurement void" and redo it, not as 0.
 - **When even the smallest batch does not fit, treat it as DEFER**: even on `VERDICT=OK`, when `HEADROOM_PCT` is below the smallest batch (it approaches 0 just under the threshold), schedule the next launch just after `RESETS_AT` with the same procedure as DEFER (FR-07). Do not keep silently holding at OK (a silent postponement violates NFR-07).
 - **The margin is deliberately doubled**: the safety factor 1.3 (absorbing estimation error) on top of the threshold (default 80) reserving the 20 points up to 100% for interactive turns. The doubling is intentional; do not remove either one.
 
@@ -214,6 +217,7 @@ Pre-flight (FR-06) only "does not start when little is left"; it **cannot save a
 - **Monitoring (polling)**: the agent wakes at a fixed interval and runs `rate-guard.sh`.
   - `OK` and running → schedule the next check.
   - `DEFER` (≥ threshold) and running → **`TaskStop(runId)`** (the journal is kept) → record `RESETS_AT` and schedule the resume (same procedure as FR-07).
+  - **`UNKNOWN` (stale, etc.) and running → do not treat it as OK (no optimism from a single reading)**. Conservatively estimate the current value as the last known `FIVE_HOUR_PCT` plus "elapsed time × burn rate", and stop with the same procedure as DEFER when the estimate is at or above the threshold. Measure the burn rate from the delta between **two points whose `written_at` (`STATE_AGE_SECONDS`) differ**. Until two measured points exist, substitute the rate derived from the unit cost used in the pre-flight budget comparison (FR-06). Because the status line is event-driven (§8), the tee does not fire while the main loop sits silent waiting for completion, so **the longer the run that needs monitoring, the more surely the copy goes stale** (measured). The permanent remedy is `statusLine.refreshInterval` (§8).
   - completion notice received → end the loop (collect the results).
 - **Derive the interval from a formula (not a fixed "N minutes")**: the monitor must wake at least once before the burn rate can eat the margin between the threshold and 100%.
 
@@ -270,7 +274,7 @@ The FR-07/08 scheduling (wakeups, session-scoped cron) and `TaskStop`/`resumeFro
 ## 7. The interface agreement (promises you must not break)
 
 1. **The state-file format** (FR-02). Do not change the key names, the epoch seconds of `written_at`, or the allowance of `null`.
-2. **The gate's standard-output agreement**: `KEY=VALUE` lines, key names `VERDICT/FIVE_HOUR_PCT/HEADROOM_PCT/RESETS_AT/RESETS_AT_HUMAN/SECONDS_TO_RESET/REASON` (`HEADROOM_PCT` added in v0.2.0). New keys may be added (additive), but existing key names must not change.
+2. **The gate's standard-output agreement**: `KEY=VALUE` lines, key names `VERDICT/FIVE_HOUR_PCT/HEADROOM_PCT/RESETS_AT/RESETS_AT_HUMAN/SECONDS_TO_RESET/STATE_AGE_SECONDS/REASON` (`HEADROOM_PCT` added in v0.2.0, `STATE_AGE_SECONDS` in 2026-07). New keys may be added (additive), but existing key names must not change.
 3. **Exit codes**: `0=OK / 10=DEFER / 20=UNKNOWN`. The caller may branch on these codes.
 4. The data flow is one-directional (§4). The gate treats the state as **read-only** and does not rewrite it.
 
@@ -279,7 +283,9 @@ The FR-07/08 scheduling (wakeups, session-scoped cron) and `TaskStop`/`resumeFro
 ## 8. Prerequisites and differences at adoption (**always check before adoption**)
 
 - **The most important prerequisite (being able to see it)**: first confirm whether the target Claude Code **actually passes** `rate_limits.five_hour.used_percentage` / `resets_at` on the status-line standard input (put an echo debug into `statusLine.command`, or look at the created state file). In an environment where it is not passed (the §2.4 fallback conditions), this tool falls back to permanent `UNKNOWN` (fail-open) and the gate does not work.
-- **When the status line runs (official)**: `statusLine.command` runs **after a new assistant message, when `/compact` completes, on a permission-mode change, and on a Vim-mode toggle**, and updates are batched over 300ms. **If not set, it never runs.** These are interactive UI actions; design on the assumption that they do not run under headless/print mode (§2.4).
+- **When the status line runs (official)**: `statusLine.command` runs **after a new assistant message, when `/compact` completes, on a permission-mode change, and on a Vim-mode toggle**, and updates are batched over 300ms. **If not set, it never runs.** These are interactive UI actions; design on the assumption that they do not run under headless/print mode (§2.4). The official docs also state that these triggers go quiet while the main session is idle (for example while a coordinator waits on background subagents) — **the tee stops exactly during the long runs that need monitoring** (FR-08, §10).
+- **Timer re-run `statusLine.refreshInterval` (official; recommended for watchdog operation)**: a setting in seconds (minimum 1) that re-runs the status line on a fixed timer in addition to the event-driven updates. It is the official remedy for the idle gap above, and the tee fires on the timer too. Measured (Claude Code 2.1.211): the setting takes effect without restarting the session, and the timer fires even while the main loop is fully idle. Around 60 seconds is recommended for watchdog (FR-08) operation.
+- **The `rate_limits` on stdin are "what this session saw in its last API response" (measured)**: a timer re-run does not fetch fresh control input; it writes the latest values the session holds. In a session that is running work, the values stay fresh too; but **the timer of a session that is running nothing overwrites old values with a new `written_at`**. With several concurrent sessions this mix makes `FIVE_HOUR_PCT` non-monotonic (a back-and-forth of a few points, measured; see the jitter note in FR-06). Read `written_at` as "when the tee ran", not as a guarantee of how fresh the values are.
 - **When `rate_limits` arrives (official)**: `rate_limits` appears on standard input **after the first API response of a Claude.ai Pro/Max subscriber**. `five_hour` / `seven_day` can each be missing. It does not arrive for API-key billing users.
 - **The visible bar is independent (official)**: even if the script outputs nothing to standard output, the status-line command runs and side effects such as file writes run. So **the tee works even in a setup with no visible bar**.
 - **Field locations depend on the version**: the key names above can change with the Claude Code version. Confirm by actually looking at the real environment's standard-input JSON.
@@ -318,6 +324,8 @@ The implementation must satisfy the following.
 | 21 | `used_percentage=79.96`, threshold 80 | `VERDICT=OK`, `FIVE_HOUR_PCT=79.96`, `HEADROOM_PCT=0.04` (the `%g` formatting keeps effective precision and does not break delta measurement) |
 | 22 | `used_percentage` is not a number (`"abc"`, etc.) | `UNKNOWN` / exit 20 (must not be coerced to 0 and return `OK` with the full `HEADROOM_PCT`) |
 | 23 | Run under a comma-decimal locale (for example `LC_ALL=de_DE.UTF-8`) | The decimal separator in numeric output stays a period (`LC_ALL=C` pinned, FR-03) |
+| 24 | Each case where `written_at` is numeric (OK / DEFER / stale / `used_percentage` null or non-numeric) | `STATE_AGE_SECONDS` equals `now - written_at` (in the "stale" case, the same value as the elapsed seconds in REASON) |
+| 25 | No state file / `written_at` missing or not a number | `STATE_AGE_SECONDS=` (empty) |
 
 ---
 
@@ -329,7 +337,7 @@ The implementation must satisfy the following.
 - **A mid-run stop does not guarantee a boundary**: because you stop from outside, the stop point is not fixed. The interrupted agent re-runs on resume, so a read-only workflow is harmless, but one with writes presupposes an idempotency key.
 - **Detect only, no enforcement**: enforcement (blocking with a hook) is a separate decision (Appendix C). This document assumes "the agent looks at it itself".
 - **Targets scope-(i) only**: dispatcher-managed tasks are out of scope.
-- **Goes stale while idle**: when rendering stops, the copy goes stale. But the gate's target is a running workflow, so the real harm is small, and the freshness check (FR-04) absorbs it with UNKNOWN.
+- **Goes stale without UI events**: the status line is event-driven (§8), so the copy goes stale not only after idle time but also **in an interactive session whose main loop sits silent waiting on background work — the tee does not fire**. The longer the run the watchdog should monitor, the more surely this gap opens (measured: during a run of about 29 minutes, four consecutive monitoring ticks went UNKNOWN while consumption kept going underneath). `statusLine.refreshInterval` (§8) removes it. In environments without it, the freshness check (FR-04) absorbs it with UNKNOWN, and the FR-08 UNKNOWN branch handles it conservatively.
 - **Authoritative but version-dependent**: the values come from the server and are not estimates, but the standard-input format depends on the Claude Code version (§8).
 
 ---
@@ -357,6 +365,8 @@ Even if the gate mechanism itself is sound, mishandled operation leads to accide
 - **Let detached subprocesses defend themselves**: if a workflow launches an external process that does not die on `TaskStop`, **give that process its own maximum run time / self-gate**. Closing the session removes the monitor (the agent), so it must be able to stop itself even with no monitor present.
 - **Derive the monitoring interval from the formula, and back off at the reset boundary**: every wake-up uses tokens, so keep the interval in minutes, but never above the FR-08 cap (`(100 - threshold) ÷ maximum burn rate`). Suppress thrash from drift in the reset estimate with a re-check guard plus backoff (NFR-08).
 - **Leave margin for heavy single workflows**: pre-flight sees only the usage rate at launch and does not know the workflow's use. For a workflow that could eat one window, **first cut it down to a size that fits, with the budget comparison (FR-06) and batch splitting (FR-09)**. For a single run that cannot be split, lower the threshold to keep margin (for example 80→60) or switch to the **FR-08 watchdog** approach.
+- **Check the fan-out of a prebuilt or named workflow before launching**: do not extrapolate the consumption feel of your own workflows onto a fan-out that is an order of magnitude larger (measured: a verifying review workflow launched at 9% usage reached 100% with 27 agents; FR-06).
+- **Measure with your session alone**: do unit-cost and burn-rate measurement (before/after delta) while no other session is consuming. The state is overwritten with "the last API response values of the session that last ran the status line", and concurrent sessions make readings wobble non-monotonically (§8, FR-06).
 - **Keep scripts and intermediate artifacts in a persistent directory**: `/tmp` is lost on a crash or reboot (FR-10). Update the resume information (resume.json) at each batch boundary.
 - **Pass the threshold through an environment variable**: fixing a permanent change in `settings.json`, etc. with a threshold below your usual usage rate means it **exceeds the threshold again after the reset and gets stuck in permanent DEFER**. Keep a threshold change in the environment variable at the gate call (one-off only).
 
@@ -413,12 +423,15 @@ Wiring into `settings.json` (for an unset environment):
 {
   "statusLine": {
     "type": "command",
-    "command": "~/.claude/statusline-command.sh"
+    "command": "~/.claude/statusline-command.sh",
+    "refreshInterval": 60
   }
 }
 ```
 
 > In an environment that already has a status line, do not change the wiring; append only the "tee" block above into that existing command. If the extraction (`five_pct`, etc.) is not defined, append the extraction lines too.
+>
+> `refreshInterval` (seconds) is optional, but **recommended for watchdog operation (FR-08, Appendix B)**: even while the main loop sits silent waiting on background work, the timer fires the tee and the copy does not go stale (§8).
 
 ### A-2. `rate-guard.sh` (the full decision script)
 
@@ -464,7 +477,7 @@ fmt_num() {
 }
 
 if [ ! -f "$STATE_FILE" ]; then
-  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "HEADROOM_PCT=" "RESETS_AT=" "RESETS_AT_HUMAN=" "SECONDS_TO_RESET=" \
+  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "HEADROOM_PCT=" "RESETS_AT=" "RESETS_AT_HUMAN=" "SECONDS_TO_RESET=" "STATE_AGE_SECONDS=" \
        "REASON=state file not found ($STATE_FILE); statusLine.command unset or tee not run yet"
   exit 20
 fi
@@ -478,27 +491,30 @@ pct_disp=$(fmt_num "$pct")
 
 case "$written" in
   ''|*[!0-9]*)
-    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
+    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" "STATE_AGE_SECONDS=" \
          "REASON=state malformed (written_at missing or non-numeric); statusline tee may be broken (see ~/.claude/rate-guard.tee.log)"
     exit 20 ;;
 esac
+# Age of the copy in seconds. The caller can measure the burn rate from this plus the
+# FIVE_HOUR_PCT history (take deltas between two points with different written_at;
+# the material for the FR-08 UNKNOWN branch and predictive DEFER).
+age=$(( now - written ))
 if [ -z "$pct" ]; then
-  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
+  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" "STATE_AGE_SECONDS=${age}" \
        "REASON=rate_limits absent (five_hour.used_percentage null); non Pro/Max or before first API response -- gate inoperative here"
   exit 20
 fi
 # A non-numeric used_percentage must not be misread as 0 and return OK; fall to UNKNOWN as corruption
 case "$pct" in
   *[!0-9.]*|*.*.*|.)
-    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
+    emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" "STATE_AGE_SECONDS=${age}" \
          "REASON=state malformed (used_percentage non-numeric); statusline tee may be broken (see ~/.claude/rate-guard.tee.log)"
     exit 20 ;;
 esac
 
-age=$(( now - written ))
 if [ "$age" -gt "$STALE_SECONDS" ]; then
-  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
-       "REASON=state stale (${age}s > ${STALE_SECONDS}s); if mid-session the statusline tee may be broken (see ~/.claude/rate-guard.tee.log)"
+  emit "VERDICT=UNKNOWN" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" "STATE_AGE_SECONDS=${age}" \
+       "REASON=state stale (${age}s > ${STALE_SECONDS}s); statusline had no UI event (happens while waiting on background work -- see statusLine.refreshInterval) or tee broken (see ~/.claude/rate-guard.tee.log)"
   exit 20
 fi
 
@@ -508,12 +524,12 @@ headroom=$(awk -v p="$pct" -v t="$THRESHOLD" 'BEGIN{h=t-p; if(h<0)h=0; printf "%
 
 over=$(awk -v p="$pct" -v t="$THRESHOLD" 'BEGIN{print (p+0 >= t+0) ? 1 : 0}')
 if [ "$over" = "1" ]; then
-  emit "VERDICT=DEFER" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=${headroom}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
+  emit "VERDICT=DEFER" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=${headroom}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" "STATE_AGE_SECONDS=${age}" \
        "REASON=5h usage ${pct_disp}% >= threshold ${THRESHOLD}%; defer launch until reset"
   exit 10
 fi
 
-emit "VERDICT=OK" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=${headroom}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" \
+emit "VERDICT=OK" "FIVE_HOUR_PCT=${pct_disp}" "HEADROOM_PCT=${headroom}" "RESETS_AT=${reset}" "RESETS_AT_HUMAN=${reset_h}" "SECONDS_TO_RESET=${secs}" "STATE_AGE_SECONDS=${age}" \
      "REASON=5h usage ${pct_disp}% < threshold ${THRESHOLD}%"
 exit 0
 ```
@@ -534,11 +550,18 @@ launch:  runId = Workflow(scriptPath, run_in_background=true)
 
 monitoring loop (wake at the formula-derived interval, run rate-guard.sh each time):
   * interval cap = (100 - threshold) ÷ maximum burn rate (FR-08)
-  VERDICT=OK    and running  → compute the burn rate (delta from the previous FIVE_HOUR_PCT)
+  VERDICT=OK    and running  → compute the burn rate (FIVE_HOUR_PCT delta between two points
+                               with different written_at; use STATE_AGE_SECONDS to skip
+                               re-reads of the same write)
                                if time-to-threshold < tick interval, same procedure as DEFER (predictive stop)
                                otherwise schedule the next check
   VERDICT=DEFER and running  → TaskStop(runId)              # the journal is kept
                                record RESETS_AT and schedule the resume (same procedure as FR-07)
+  VERDICT=UNKNOWN (stale) and running
+                             → do not treat as OK: conservatively estimate
+                               last known value + elapsed time × burn rate; at or above the
+                               threshold, same procedure as DEFER (until two measured points
+                               exist, substitute the pre-flight estimated unit cost; FR-08)
   completion notice received → end the loop (collect the results, mark resume.json done)
 
 resume (when the schedule fires):
@@ -552,6 +575,7 @@ resume (when the schedule fires):
 - **The value of stopping on purpose at 80%**: if you wait for the 100% hit, the Workflow's `agent()` is swallowed into `null` after retries, and **a degraded result is returned silently** (a silent cutoff). A `TaskStop` at the threshold stops cleanly and keeps the journal, which avoids this.
 - **Derive the interval from the formula**: a fixed "N minutes" can fail to reach a highly parallel fleet (a 20-minute interval has been observed to lose everything before its first tick). The cap is `(100 - threshold) ÷ maximum burn rate`. Also allow for the state's freshness (as of the last status-line run) adding to the effective lag (FR-08).
 - **Predictive DEFER**: keep the previous tick's `FIVE_HOUR_PCT`, and when the burn rate predicts "the next tick would be too late", stop even below the threshold (FR-08).
+- **The stale gap and the monitor's form**: an agent-wakeup monitor (`ScheduleWakeup`, etc.) has a side effect — the assistant message at each wake-up itself fires the status line and refreshes the copy (§8). Replacing it with a resident shell loop or similar cuts token use but **severs this implicit refresh path and invites staleness on its own** (measured: four consecutive UNKNOWN ticks while monitoring a run). When using a shell-loop form, either set `statusLine.refreshInterval` (§8) or implement the UNKNOWN branch (FR-08); one of the two is required.
 - **The stop point is not fixed**: because you monitor from outside, it does not stop at a boundary (the phase boundary). The agent that was running at the interruption re-runs on resume. **A read-only workflow (code review, etc.) is harmless.** One with writes (files / external posts / DB updates / uploads) is limited to the range where an idempotency key (request_hash/batch_id, etc. = loose-coupling agreement #4) can absorb a double fire.
 - **Resume prerequisite**: the script must be deterministic (must not depend on `Date.now()`/randomness). With the same script and same args, completed agents are restored from the cache 100%. `resumeFromRunId` is **same-session only**; after a crash, switch to the FR-10 path (read the journal and write out a continuation script).
 - **Detached subprocesses**: if the workflow launches an external process, it does not die on `TaskStop`. On resume, do not re-launch; **monitor an existing marker/lock (the PID being alive)** to continue (the detach-plus-monitor approach).
